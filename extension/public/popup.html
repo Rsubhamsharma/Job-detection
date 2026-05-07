@@ -3,7 +3,7 @@
   <head>
     <style>
       body {
-        width: 300px;
+        width: 320px;
         font-family: "Segoe UI", Tahoma, Geneva, Verdana, sans-serif;
         margin: 0;
         padding: 16px;
@@ -14,93 +14,116 @@
         display: flex;
         align-items: center;
         justify-content: space-between;
-        margin-bottom: 20px;
+        margin-bottom: 16px;
       }
       .logo {
         font-weight: bold;
         font-size: 18px;
         color: #bb86fc;
       }
-      .score-container {
-        text-align: center;
-        padding: 20px;
+      .panel {
         background: #1e1e1e;
         border-radius: 12px;
         border: 1px solid #333;
+        padding: 16px;
+      }
+      .hidden { display: none; }
+      input {
+        width: 100%;
+        box-sizing: border-box;
+        margin-bottom: 10px;
+        padding: 10px;
+        border-radius: 8px;
+        border: 1px solid #333;
+        background: #121212;
+        color: #e0e0e0;
+      }
+      button {
+        width: 100%;
+        padding: 10px;
+        border: 0;
+        border-radius: 8px;
+        background: #6366f1;
+        color: white;
+        font-weight: bold;
+        cursor: pointer;
+      }
+      .secondary {
+        margin-top: 10px;
+        background: transparent;
+        border: 1px solid #444;
+      }
+      .settings {
+        margin-top: 12px;
+        border-top: 1px solid #333;
+        padding-top: 12px;
       }
       .score-value {
-        font-size: 48px;
+        font-size: 40px;
         font-weight: bold;
-        margin: 10px 0;
+        margin: 8px 0;
       }
-      .score-label {
-        font-size: 14px;
+      .muted {
+        font-size: 12px;
         color: #999;
       }
-      .recommendation {
-        margin-top: 20px;
-        padding: 12px;
-        border-radius: 8px;
-        font-size: 14px;
-        line-height: 1.4;
+      .error {
+        color: #ff8a80;
+        font-size: 12px;
+        margin-top: 8px;
       }
-      .rec-safe {
-        background: rgba(3, 218, 198, 0.1);
-        color: #03dac6;
-        border: 1px solid rgba(3, 218, 198, 0.3);
-      }
-      .rec-warning {
-        background: rgba(255, 183, 77, 0.1);
-        color: #ffb74d;
-        border: 1px solid rgba(255, 183, 77, 0.3);
-      }
-      .rec-danger {
-        background: rgba(207, 102, 121, 0.1);
-        color: #cf6679;
-        border: 1px solid rgba(207, 102, 121, 0.3);
-      }
-
       .stats {
-        margin-top: 15px;
+        margin-top: 12px;
         display: grid;
         grid-template-columns: 1fr 1fr;
-        gap: 10px;
+        gap: 8px;
       }
-      .stat-item {
+      .sync {
+        margin-top: 12px;
+        padding: 10px;
+        background: #171717;
+        border: 1px solid #2d2d2d;
+        border-radius: 8px;
         font-size: 12px;
-        color: #888;
-      }
-      .stat-value {
-        font-weight: bold;
-        color: #ddd;
       }
     </style>
   </head>
   <body>
     <div class="header">
       <div class="logo">AESD</div>
-      <div id="status">Active</div>
+      <div id="status">Checking...</div>
     </div>
 
-    <div class="score-container">
-      <div class="score-label">Energy Sink Score</div>
+    <div id="loginPanel" class="panel hidden">
+      <div class="muted" style="margin-bottom: 12px;">Login to connect your AESD Extension</div>
+      <input id="email" type="email" placeholder="Email" />
+      <input id="password" type="password" placeholder="Password" />
+      <input id="apiUrl" type="url" placeholder="Backend URL" />
+      <button id="loginButton">Login</button>
+      <button id="openWebLogin" class="secondary">Open Web Login</button>
+      <div id="loginError" class="error"></div>
+    </div>
+
+    <div id="scorePanel" class="panel hidden">
+      <div class="muted">Energy Sink Score</div>
       <div id="score" class="score-value">--</div>
-      <div id="company" style="font-size: 14px; color: #bbb">
-        Detecting job...
+      <div id="company">Detecting job...</div>
+      <div id="recommendation" class="muted" style="margin-top: 10px;">Analyzing...</div>
+      <div class="stats">
+        <div>Effort: <span id="effort">0</span></div>
+        <div>Responses: <span id="responses">0</span></div>
       </div>
-    </div>
-
-    <div id="recommendation" class="recommendation">
-      Analyzing behavioral signals for this job posting...
-    </div>
-
-    <div class="stats">
-      <div class="stat-item">
-        Effort Units: <span id="effort" class="stat-value">0</span>
+      <div class="sync">
+        <div>Total signals: <span id="capturedCount">0</span></div>
+        <div>Pending sync: <span id="pendingCount">0</span></div>
+        <div id="syncStatus">Checking sync...</div>
       </div>
-      <div class="stat-item">
-        Responses: <span id="responses" class="stat-value">0</span>
+      <div class="settings">
+        <input id="scoreApiUrl" type="url" placeholder="Backend URL" />
+        <button id="saveSettingsButton" class="secondary">Save Backend URL</button>
       </div>
+      <button id="syncNowButton" class="secondary">Sync Now</button>
+      <button id="logoutButton" class="secondary">Logout</button>
     </div>
 
     <script src="popup.js"></script>

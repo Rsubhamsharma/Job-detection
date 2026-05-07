@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useCallback } from 'react'
 import axios from 'axios'
 import { motion, AnimatePresence } from 'framer-motion'
 import { 
@@ -12,6 +12,129 @@ import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContai
 import './index.css'
 
 const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:8000'
+const MotionDiv = motion.div
+const LOCAL_USERS_KEY = 'jobzoid-local-users'
+const SESSION_USER_KEY = 'jobzoid-session-user'
+const LAST_AUTH_EMAIL_KEY = 'jobzoid-last-auth-email'
+
+const getLocalUsers = () => {
+  try {
+    return JSON.parse(localStorage.getItem(LOCAL_USERS_KEY) || '{}')
+  } catch {
+    return {}
+  }
+}
+
+const saveLocalUser = (user) => {
+  const users = getLocalUsers()
+  users[user.email] = user
+  localStorage.setItem(LOCAL_USERS_KEY, JSON.stringify(users))
+}
+
+const getStoredSessionUser = () => {
+  try {
+    const sessionUser = JSON.parse(localStorage.getItem(SESSION_USER_KEY) || 'null')
+    if (sessionUser) {
+      return sessionUser
+    }
+
+    const lastAuthEmail = localStorage.getItem(LAST_AUTH_EMAIL_KEY)
+    if (!lastAuthEmail) {
+      return null
+    }
+
+    const localUser = getLocalUsers()[lastAuthEmail]
+    if (!localUser) {
+      return null
+    }
+
+    return {
+      ...localUser,
+      avatar: localUser.avatar || `https://i.pravatar.cc/150?u=${localUser.email}`,
+    }
+  } catch {
+    return null
+  }
+}
+
+const saveSessionUser = (user) => {
+  localStorage.setItem(SESSION_USER_KEY, JSON.stringify(user))
+  if (user?.email) {
+    localStorage.setItem(LAST_AUTH_EMAIL_KEY, user.email)
+  }
+}
+
+const clearSessionUser = () => {
+  localStorage.removeItem(SESSION_USER_KEY)
+}
+
+const getAuthHeaders = (token) => (
+  token ? { Authorization: `Bearer ${token}` } : {}
+)
+
+const formatTimestamp = (value) => {
+  if (!value) return 'No data yet'
+  const date = new Date(value)
+  if (Number.isNaN(date.getTime())) return 'No data yet'
+  return date.toLocaleString()
+}
+
+const formatScore = (job) => {
+  if (job?.scoreStatus === 'not_enough_effort_data' || job?.scoreStatus === 'not_enough_data') {
+    return 'Not enough effort data'
+  }
+  if (job?.energySinkScore !== null && job?.energySinkScore !== undefined) {
+    return Math.round(job.energySinkScore)
+  }
+  return '--'
+}
+
+const formatEffortResponse = (job) => {
+  const effort = Math.round(job?.effortScore ?? 0)
+  const response = Math.round(job?.responseScore ?? 0)
+  if (job?.scoreStatus !== 'scored' && effort === 0) {
+    return 'Not enough effort data'
+  }
+  return `Effort ${effort} | Response ${response > 0 ? response : 'pending'}`
+}
+
+const formatRecommendation = (job) => {
+  const scoreStatus = job?.scoreStatus || 'not_enough_effort_data'
+  const energySinkScore = job?.energySinkScore
+  
+  // PHASE 9 rules
+  if (scoreStatus === 'not_enough_effort_data' || scoreStatus === 'not_enough_data') {
+    return 'Tracking'
+  }
+  if (energySinkScore === null || energySinkScore === undefined) {
+    return 'Tracking'
+  }
+  if (scoreStatus === 'scored') {
+    if (energySinkScore >= 70) {
+      return 'Avoid'
+    } else if (energySinkScore >= 40) {
+      return 'Apply cautiously'
+    } else {
+      return 'Apply confidently'
+    }
+  }
+  return 'Tracking'
+}
+
+const getRecommendationClass = (job) => {
+  if (job?.scoreStatus === 'tracking_response_pending' || job?.scoreStatus === 'response_pending') return 'bg-amber-100 text-amber-600'
+  if (job?.scoreStatus !== 'scored') return 'bg-slate-100 text-slate-600'
+  if (job.recommendation === 'Avoid') return 'bg-rose-100 text-rose-600'
+  if (job.recommendation === 'Apply cautiously') return 'bg-amber-100 text-amber-600'
+  return 'bg-emerald-100 text-emerald-600'
+}
+
+const getScoreDotClass = (job) => {
+  if (job?.scoreStatus === 'not_enough_effort_data' || job?.scoreStatus === 'not_enough_data') return 'bg-slate-400'
+  if (job.energySinkScore >= 70) return 'bg-rose-500'
+  if (job.energySinkScore >= 40) return 'bg-amber-500'
+  return 'bg-emerald-500'
+}
 
 // --- COMPONENTS ---
 
@@ -76,24 +199,29 @@ const EnergySinkGauge = ({ score }) => {
   )
 }
 
-const CommunityLeaderboard = () => {
-  const topCompanies = [
-    { name: 'Google', responseRate: '92%', avgDays: 4, score: 12, status: 'Verified Gold' },
-    { name: 'Stripe', responseRate: '88%', avgDays: 6, score: 15, status: 'Top Rated' },
-    { name: 'Netflix', responseRate: '85%', avgDays: 5, score: 14, status: 'Responsive' }
-  ];
+const CommunityLeaderboard = ({ user }) => {
+  const [leaderboard, setLeaderboard] = useState({ mostResponsive: [], topEnergySinks: [] })
+  const [error, setError] = useState('')
 
-  const energySinks = [
-    { name: 'GhostCorp', avgEffort: '950 pts', responseRate: '2%', score: 88 },
-    { name: 'Legacy Systems', avgEffort: '720 pts', responseRate: '5%', score: 76 },
-    { name: 'Shadow Inc', avgEffort: '680 pts', responseRate: '8%', score: 72 }
-  ];
+  useEffect(() => {
+    if (!user?.token) return
+    axios.get(`${API_URL}/api/community/leaderboard`, { headers: getAuthHeaders(user.token) })
+      .then(res => {
+        setLeaderboard(res.data || { mostResponsive: [], topEnergySinks: [] })
+        setError('')
+      })
+      .catch(() => setError('Leaderboard data is unavailable until the backend is connected.'))
+  }, [user?.token])
+
+  const topCompanies = leaderboard.mostResponsive || []
+  const energySinks = leaderboard.topEnergySinks || []
 
   return (
     <div className="pt-24 px-6 max-w-7xl mx-auto pb-32">
        <div className="text-center mb-16">
           <h2 className="text-4xl font-black text-slate-900 dark:text-white mb-4">Community Fairness Leaderboard</h2>
-          <p className="text-slate-600 dark:text-slate-400 font-medium italic">Aggregated data from 50k+ job seekers. Transparency enforced by evidence.</p>
+          <p className="text-slate-600 dark:text-slate-400 font-medium italic">Live company rollups from captured application signals.</p>
+          {error && <p className="mt-4 text-sm font-bold text-amber-600">{error}</p>}
        </div>
 
        <div className="grid md:grid-cols-2 gap-12">
@@ -102,21 +230,21 @@ const CommunityLeaderboard = () => {
                 <CheckCircle size={24} /> Most Responsive
              </h3>
              <div className="space-y-4">
-                {topCompanies.map((c, i) => (
+                {topCompanies.length ? topCompanies.map((c, i) => (
                    <div key={i} className="glass-card dark:bg-slate-900/50 flex items-center justify-between border-l-4 border-l-emerald-500">
                       <div>
-                         <p className="font-black text-lg dark:text-white">{c.name}</p>
+                         <p className="font-black text-lg dark:text-white">{c.companyName}</p>
                          <div className="flex gap-4 mt-1">
                             <span className="text-[10px] font-bold text-slate-400 uppercase tracking-widest">{c.status}</span>
-                            <span className="text-[10px] font-bold text-indigo-500 uppercase tracking-widest">{c.avgDays} Day Response</span>
+                            <span className="text-[10px] font-bold text-indigo-500 uppercase tracking-widest">{c.applications} tracked jobs</span>
                          </div>
                       </div>
                       <div className="text-right">
-                         <p className="text-2xl font-black text-emerald-600">{c.responseRate}</p>
+                         <p className="text-2xl font-black text-emerald-600">{c.responseRate}%</p>
                          <p className="text-[10px] font-bold text-slate-400 uppercase">Yield</p>
                       </div>
                    </div>
-                ))}
+                )) : <div className="glass-card dark:bg-slate-900/50 text-slate-500 font-bold">No response signals captured yet.</div>}
              </div>
           </div>
 
@@ -125,28 +253,28 @@ const CommunityLeaderboard = () => {
                 <AlertCircle size={24} /> Top Energy Sinks
              </h3>
              <div className="space-y-4">
-                {energySinks.map((c, i) => (
+                {energySinks.length ? energySinks.map((c, i) => (
                    <div key={i} className="glass-card dark:bg-slate-900/50 flex items-center justify-between border-l-4 border-l-rose-500">
                       <div>
-                         <p className="font-black text-lg dark:text-white">{c.name}</p>
+                         <p className="font-black text-lg dark:text-white">{c.companyName}</p>
                          <div className="flex gap-4 mt-1">
-                            <span className="text-[10px] font-bold text-slate-400 uppercase tracking-widest">Sink Score: {c.score}</span>
+                            <span className="text-[10px] font-bold text-slate-400 uppercase tracking-widest">Sink Score: {c.averageEnergyScore}</span>
                             <span className="text-[10px] font-bold text-rose-500 uppercase tracking-widest">High Complexity</span>
                          </div>
                       </div>
                       <div className="text-right">
-                         <p className="text-2xl font-black text-rose-600">{c.responseRate}</p>
+                         <p className="text-2xl font-black text-rose-600">{c.responseRate}%</p>
                          <p className="text-[10px] font-bold text-slate-400 uppercase">Yield</p>
                       </div>
                    </div>
-                ))}
+                )) : <div className="glass-card dark:bg-slate-900/50 text-slate-500 font-bold">No high sink companies detected yet.</div>}
              </div>
           </div>
        </div>
 
        <div className="mt-20 p-8 glass-card bg-indigo-600 text-white text-center">
           <h4 className="text-2xl font-black mb-4 italic">Is your company missing?</h4>
-          <p className="text-indigo-100 font-medium mb-8 max-w-xl mx-auto">Verified recruiters can claim their profile to fix data inaccuracies through official response velocity tracking.</p>
+          <p className="text-indigo-100 font-medium mb-8 max-w-xl mx-auto">Verified recruiters can improve these metrics by sending timely response signals.</p>
           <button className="bg-white text-indigo-600 px-10 py-4 rounded-xl font-black tracking-wide hover:bg-indigo-50 transition-colors">Claim Company Profile</button>
        </div>
     </div>
@@ -189,34 +317,27 @@ const LandingPage = ({ onGetStarted, setActiveTab }) => (
   </div>
 )
 
-const PersonalAnalytics = ({ jobs }) => {
-  const data = [
-    { name: 'Mon', effort: 400, responses: 240 },
-    { name: 'Tue', effort: 300, responses: 139 },
-    { name: 'Wed', effort: 200, responses: 980 },
-    { name: 'Thu', effort: 278, responses: 390 },
-    { name: 'Fri', effort: 189, responses: 480 },
-    { name: 'Sat', effort: 239, responses: 380 },
-    { name: 'Sun', effort: 349, responses: 430 },
-  ];
-
-  const [emailSignals, setEmailSignals] = useState([
-    { type: 'INTERVIEW', company: 'Google', date: '2026-01-28', status: 'Detected' },
-    { type: 'ACK', company: 'Netflix', date: '2026-01-27', status: 'Verified' },
-  ])
+const PersonalAnalytics = ({ analytics, lastUpdated }) => {
+  const chartData = [
+    { name: 'Applications', effort: analytics.totalApplications || 0, responses: analytics.averageResponseRate || 0 },
+    { name: 'Average', effort: analytics.averageEnergyScore || 0, responses: analytics.averageResponseRate || 0 },
+  ]
 
   const stats = [
-    { label: 'Avg Effort/Job', value: '450 pts', icon: Zap, color: 'text-amber-500' },
-    { label: 'Response Yield', value: '12%', icon: TrendingUp, color: 'text-emerald-500' },
-    { label: 'Energy Wasted', value: '24 hrs', icon: Clock, color: 'text-rose-500' },
-    { label: 'Active Leads', value: '3', icon: Activity, color: 'text-indigo-500' },
-  ];
+    { label: 'Total Applications', value: analytics.totalApplications ?? 0, icon: Activity, color: 'text-indigo-500' },
+    { label: 'Response Rate', value: `${analytics.averageResponseRate ?? 0}%`, icon: TrendingUp, color: 'text-emerald-500' },
+    { label: 'Average Score', value: analytics.averageEnergyScore ?? 0, icon: Zap, color: 'text-amber-500' },
+    { label: 'Last Updated', value: lastUpdated ? new Date(lastUpdated).toLocaleTimeString() : 'No data', icon: Clock, color: 'text-rose-500' },
+  ]
+
+  const topRiskyCompanies = analytics.topRiskyCompanies || []
+  const bestCompanies = analytics.bestCompanies || []
 
   return (
     <div className="pt-24 px-6 max-w-7xl mx-auto pb-20">
       <div className="mb-12">
         <h2 className="text-3xl font-black text-slate-900 dark:text-white">Your Analytics</h2>
-        <p className="text-slate-600 dark:text-slate-400 font-medium italic tracking-tight">Measuring your personal effort vs. employer outcomes.</p>
+        <p className="text-slate-600 dark:text-slate-400 font-medium tracking-tight">Live Data from Extension</p>
       </div>
 
       <div className="grid grid-cols-2 md:grid-cols-4 gap-6 mb-12">
@@ -230,117 +351,112 @@ const PersonalAnalytics = ({ jobs }) => {
       </div>
 
       <div className="grid lg:grid-cols-3 gap-8 mb-12">
-        <div className="lg:col-span-2 glass-card dark:bg-slate-900/50 min-h-[400px]">
+        <div className="lg:col-span-2 glass-card dark:bg-slate-900/50 min-h-[320px]">
           <h3 className="text-lg font-black mb-8 dark:text-white flex items-center gap-2">
-            <BarChart2 size={20} className="text-indigo-500" /> Effort vs. Response YIELD (Weekly)
+            <BarChart2 size={20} className="text-indigo-500" /> Extension Summary
           </h3>
-          <div className="h-[300px]">
+          <div className="h-[240px]">
             <ResponsiveContainer width="100%" height="100%">
-              <LineChart data={data}>
+              <LineChart data={chartData}>
                 <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#e2e8f0" />
                 <XAxis dataKey="name" axisLine={false} tickLine={false} />
                 <YAxis axisLine={false} tickLine={false} />
-                <Tooltip 
-                  contentStyle={{ backgroundColor: '#fff', borderRadius: '12px', border: 'none', boxShadow: '0 10px 15px -3px rgb(0 0 0 / 0.1)' }}
-                />
-                <Line type="monotone" dataKey="effort" stroke="#6366f1" strokeWidth={4} dot={{ r: 6 }} activeDot={{ r: 8 }} />
-                <Line type="monotone" dataKey="responses" stroke="#10b981" strokeWidth={4} dot={{ r: 6 }} activeDot={{ r: 8 }} />
+                <Tooltip />
+                <Line type="monotone" dataKey="effort" stroke="#6366f1" strokeWidth={4} dot={{ r: 6 }} />
+                <Line type="monotone" dataKey="responses" stroke="#10b981" strokeWidth={4} dot={{ r: 6 }} />
               </LineChart>
             </ResponsiveContainer>
           </div>
         </div>
 
         <div className="glass-card dark:bg-slate-900/50">
-          <h3 className="text-lg font-black mb-8 dark:text-white flex items-center gap-2">
-            <Mail size={20} className="text-indigo-500" /> Passive Signal Feed
+          <h3 className="text-lg font-black mb-6 dark:text-white flex items-center gap-2">
+            <AlertCircle size={20} className="text-rose-500" /> Top Risky Companies
           </h3>
           <div className="space-y-4">
-            {emailSignals.map((sig, i) => (
-              <div key={i} className="flex items-center justify-between p-3 bg-slate-50 dark:bg-slate-800/50 rounded-lg border border-slate-100 dark:border-slate-800">
-                <div className="flex items-center gap-3">
-                  <div className={`p-2 rounded-md ${sig.type === 'INTERVIEW' ? 'bg-indigo-100 text-indigo-600' : 'bg-slate-100 text-slate-600'}`}>
-                    {sig.type === 'INTERVIEW' ? <Clock size={16} /> : <Check size={16} />}
-                  </div>
-                  <div>
-                    <p className="text-sm font-bold dark:text-white">{sig.company}</p>
-                    <p className="text-[10px] text-slate-400 font-bold uppercase tracking-tight">{sig.type}</p>
-                  </div>
-                </div>
-                <span className="text-[10px] font-black text-slate-300">{sig.date}</span>
+            {topRiskyCompanies.length ? topRiskyCompanies.map((company, i) => (
+              <div key={i} className="p-3 bg-slate-50 dark:bg-slate-800/50 rounded-lg border border-slate-100 dark:border-slate-800">
+                <p className="text-sm font-bold dark:text-white">{company.companyName}</p>
+                <p className="text-[10px] text-slate-400 font-bold uppercase tracking-tight">{company.jobTitle}</p>
+                <p className="text-sm font-black text-rose-500 mt-2">{company.energySinkScore}</p>
               </div>
-            ))}
-            <p className="text-[10px] text-center text-slate-400 font-medium italic mt-4">Signals are extracted from email headers only (Privacy-Locked Protocol).</p>
+            )) : <p className="text-sm text-slate-400">No data yet</p>}
           </div>
         </div>
 
-        <div className="glass-card dark:bg-slate-900/50">
-          <h3 className="text-lg font-black mb-8 dark:text-white flex items-center gap-2">
-            <Shield size={20} className="text-emerald-500" /> Sink Mitigation
+        <div className="glass-card dark:bg-slate-900/50 lg:col-span-3">
+          <h3 className="text-lg font-black mb-6 dark:text-white flex items-center gap-2">
+            <CheckCircle size={20} className="text-emerald-500" /> Best Companies
           </h3>
-          <div className="space-y-6">
-            <div className="p-4 bg-emerald-50 dark:bg-emerald-900/20 border border-emerald-100 dark:border-emerald-800 rounded-xl">
-              <p className="text-sm font-bold text-emerald-700 dark:text-emerald-400 mb-1">Applications Avoided</p>
-              <p className="text-2xl font-black text-emerald-800 dark:text-emerald-300">14</p>
-            </div>
-            <div className="p-4 bg-indigo-50 dark:bg-indigo-900/20 border border-indigo-100 dark:border-indigo-800 rounded-xl">
-              <p className="text-sm font-bold text-indigo-700 dark:text-indigo-400 mb-1">Time Saved</p>
-              <p className="text-2xl font-black text-indigo-800 dark:text-indigo-300">10h 45m</p>
-            </div>
-            <p className="text-xs text-slate-400 italic">Based on high-sink triggers blocked by the JobZoid extension.</p>
+          <div className="grid md:grid-cols-2 gap-4">
+            {bestCompanies.length ? bestCompanies.map((company, i) => (
+              <div key={i} className="p-4 bg-slate-50 dark:bg-slate-800/50 rounded-lg border border-slate-100 dark:border-slate-800">
+                <p className="text-sm font-bold dark:text-white">{company.companyName}</p>
+                <p className="text-[10px] text-slate-400 font-bold uppercase tracking-tight">{company.jobTitle}</p>
+                <p className="text-sm font-black text-emerald-500 mt-2">{company.energySinkScore}</p>
+              </div>
+            )) : <p className="text-sm text-slate-400">No data yet</p>}
           </div>
         </div>
       </div>
     </div>
-  );
-};
+  )
+}
 
-const Dashboard = ({ jobs, onSelectJob, onNavigateToAnalytics }) => (
+const Dashboard = ({ jobs, onSelectJob, onNavigateToAnalytics, onRefresh, lastUpdated, signalCount, latestScore }) => (
   <div className="pt-24 px-6 max-w-7xl mx-auto">
     <div className="flex flex-col md:flex-row md:items-center justify-between gap-6 mb-12">
       <div>
         <h2 className="text-3xl font-black text-slate-900 dark:text-white">Dashboard</h2>
-        <p className="text-slate-600 dark:text-slate-400 font-medium tracking-tight">Tracked Jobs & Employer Responsiveness</p>
+        <p className="text-slate-600 dark:text-slate-400 font-medium tracking-tight">Live Data from Extension</p>
+        <p className="text-xs font-bold text-slate-400 uppercase tracking-widest mt-2">
+          {signalCount ?? 0} signals captured - Latest Score {latestScore ?? 'Not enough data'}
+        </p>
       </div>
-      <button className="btn-primary bg-indigo-50 dark:bg-indigo-900/30 text-indigo-700 dark:text-indigo-300 hover:bg-indigo-100 dark:hover:bg-indigo-900/50 flex items-center gap-2 px-4 py-2 text-sm"><Search size={16} /> Lookup Company</button>
+      <div className="flex items-center gap-3">
+        <button onClick={onRefresh} className="text-sm font-bold text-indigo-600 dark:text-indigo-400 hover:underline">Refresh</button>
+        <div className="text-sm font-bold text-slate-500 dark:text-slate-400">Last Updated: {formatTimestamp(lastUpdated)}</div>
+      </div>
     </div>
 
     <div className="glass-card overflow-hidden !p-0 border-slate-200 dark:border-slate-800 dark:bg-slate-900/50">
       <table className="w-full text-left">
         <thead className="bg-slate-50 dark:bg-slate-800/50 border-b border-slate-200 dark:border-slate-800">
           <tr>
+            <th className="px-8 py-4 text-xs font-bold text-slate-400 dark:text-slate-500 uppercase tracking-widest">Job</th>
             <th className="px-8 py-4 text-xs font-bold text-slate-400 dark:text-slate-500 uppercase tracking-widest">Company</th>
-            <th className="px-8 py-4 text-xs font-bold text-slate-400 dark:text-slate-500 uppercase tracking-widest">AI Authenticity</th>
-            <th className="px-8 py-4 text-xs font-bold text-slate-400 dark:text-slate-500 uppercase tracking-widest">Sink Score</th>
-            <th className="px-8 py-4 text-xs font-bold text-slate-400 dark:text-slate-500 uppercase tracking-widest">Status</th>
+            <th className="px-8 py-4 text-xs font-bold text-slate-400 dark:text-slate-500 uppercase tracking-widest">Energy Score</th>
+            <th className="px-8 py-4 text-xs font-bold text-slate-400 dark:text-slate-500 uppercase tracking-widest">Effort vs Response</th>
+            <th className="px-8 py-4 text-xs font-bold text-slate-400 dark:text-slate-500 uppercase tracking-widest">Recommendation</th>
             <th className="px-8 py-4 text-xs font-bold text-slate-400 dark:text-slate-500 uppercase tracking-widest text-right">Action</th>
           </tr>
         </thead>
         <tbody className="divide-y divide-slate-100 dark:divide-slate-800">
-          {jobs.map((j) => (
-            <tr key={j.id} className="hover:bg-slate-50 dark:hover:bg-slate-800/50 transition-colors group">
-              <td className="px-8 py-6 font-bold text-slate-900 dark:text-white">{j.company_name}</td>
+          {jobs.length ? jobs.map((j) => (
+            <tr key={j.jobId} className="hover:bg-slate-50 dark:hover:bg-slate-800/50 transition-colors group">
+              <td className="px-8 py-6 font-bold text-slate-900 dark:text-white">{j.jobTitle}</td>
+              <td className="px-8 py-6 font-bold text-slate-900 dark:text-white">{j.companyName}</td>
               <td className="px-8 py-6">
                 <div className="flex items-center gap-2">
-                   <div className={`w-2 h-2 rounded-full ${j.ai_score > 70 ? 'bg-indigo-500' : 'bg-rose-500'}`} />
-                   <span className="text-sm font-bold dark:text-slate-300">{j.ai_score}%</span>
+                   <div className={`w-2 h-2 rounded-full ${getScoreDotClass(j)}`} />
+                <span className="text-sm font-bold dark:text-slate-300 whitespace-nowrap">{formatScore(j)}</span>
                 </div>
               </td>
               <td className="px-8 py-6">
-                <div className="flex items-center gap-3">
-                  <div className={`w-3 h-3 rounded-full ${j.score > 60 ? 'bg-rose-500 shadow-sm shadow-rose-200 dark:shadow-none' : (j.score > 30 ? 'bg-amber-500' : 'bg-emerald-500')}`} />
-                  <span className={`text-sm font-extrabold ${j.score > 60 ? 'text-rose-600 dark:text-rose-400' : (j.score > 30 ? 'text-amber-600 dark:text-amber-400' : 'text-emerald-600 dark:text-emerald-400')}`}>
-                    {j.score}
-                  </span>
-                </div>
+                <span className="text-sm font-extrabold text-slate-700 dark:text-slate-300 whitespace-nowrap">{formatEffortResponse(j)}</span>
               </td>
               <td className="px-8 py-6">
-                <span className="text-xs font-bold px-2 py-1 bg-slate-100 dark:bg-slate-800 rounded text-slate-500 dark:text-slate-400 uppercase">{j.status}</span>
+                <span className={`text-xs font-bold px-2 py-1 rounded uppercase whitespace-nowrap ${getRecommendationClass(j)}`}>{formatRecommendation(j)}</span>
               </td>
               <td className="px-8 py-6 text-right">
                 <button onClick={() => onSelectJob(j)} className="text-indigo-600 dark:text-indigo-400 font-bold text-sm hover:underline transition-all">View</button>
               </td>
             </tr>
-          ))}
+          )) : (
+            <tr>
+              <td colSpan="6" className="px-8 py-10 text-center text-slate-400 font-medium">No valid tracked jobs yet</td>
+            </tr>
+          )}
         </tbody>
       </table>
       <div className="p-6 bg-slate-50 dark:bg-slate-800/50 text-center">
@@ -350,13 +466,63 @@ const Dashboard = ({ jobs, onSelectJob, onNavigateToAnalytics }) => (
         >
           <BarChart2 size={16} /> View Personal Effort Analytics
         </button>
-        <button 
-          onClick={() => setActiveTab('leaderboard')}
-          className="text-slate-400 font-bold text-xs hover:text-indigo-600 mt-4 underline decoration-dotted"
-        >
-          See Community Fairness Rankings
-        </button>
       </div>
+    </div>
+  </div>
+)
+
+const SocialButton = ({ label, onClick, brand }) => (
+  <button
+    onClick={onClick}
+    className="w-full flex items-center justify-center gap-3 py-3 px-4 border border-slate-200 dark:border-slate-800 rounded-lg font-bold bg-white dark:bg-slate-800 text-slate-700 dark:text-white hover:bg-slate-50 dark:hover:bg-slate-700 transition-all text-sm"
+  >
+    {brand === 'google' ? (
+      <svg className="w-5 h-5" viewBox="0 0 24 24">
+        <path fill="#4285F4" d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92c-.26 1.37-1.04 2.53-2.21 3.31v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.09z"/>
+        <path fill="#34A853" d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z"/>
+        <path fill="#FBBC05" d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.07H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.93l3.66-2.84z"/>
+        <path fill="#EA4335" d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.07l3.66 2.84c.87-2.6 3.3-4.53 6.16-4.53z"/>
+      </svg>
+    ) : (
+      <svg className="w-5 h-5" viewBox="0 0 23 23">
+        <path fill="#f3f3f3" d="M0 0h23v23H0z"/>
+        <path fill="#f35325" d="M1 1h10v10H1z"/>
+        <path fill="#81bc06" d="M12 1h10v10H12z"/>
+        <path fill="#05a6f0" d="M1 12h10v10H1z"/>
+        <path fill="#ffba08" d="M12 12h10v10H12z"/>
+      </svg>
+    )}
+    <span>{label}</span>
+  </button>
+)
+
+const InputField = ({
+  label,
+  type = 'text',
+  placeholder,
+  value,
+  onChange,
+  fullWidth = true,
+  icon: Icon,
+  onIconClick,
+}) => (
+  <div className={`${fullWidth ? 'w-full' : 'w-1/2'} mb-4 text-left`}>
+    <label className="block text-xs font-bold text-slate-500 mb-1 ml-1">{label}</label>
+    <div className="relative">
+      <input
+        type={type}
+        placeholder={placeholder}
+        value={value}
+        onChange={onChange}
+        className="w-full px-4 py-3 bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-lg outline-none focus:border-indigo-500 transition-all font-medium text-sm text-slate-900 dark:text-white"
+      />
+      {Icon && (
+        <Icon
+          size={16}
+          className="absolute right-4 top-1/2 -translate-y-1/2 text-slate-400 cursor-pointer"
+          onClick={onIconClick}
+        />
+      )}
     </div>
   </div>
 )
@@ -369,23 +535,72 @@ const AuthModal = ({ mode = 'login', onClose, onAuth }) => {
   const [isLoading, setIsLoading] = useState(false)
   const [error, setError] = useState('')
   const [agreedToTerms, setAgreedToTerms] = useState(false)
+  const [verifiedAuth, setVerifiedAuth] = useState(null)
+  const [resetOtp, setResetOtp] = useState('')
+  const [newPassword, setNewPassword] = useState('')
+  const bypassOtpForLocalSignup = true
+  const isSignupReady = (
+    agreedToTerms &&
+    formData.email &&
+    formData.password &&
+    formData.confirmPassword &&
+    formData.password === formData.confirmPassword &&
+    !isLoading
+  )
 
   const handleAction = async (nextStep, delay = 1000) => {
     setIsLoading(true)
     setError('')
     try {
-        if (nextStep === 'otp' && (step === 'password' || step === 'signup-form')) {
-            await axios.post(`${API_URL}/api/auth/request-otp`, { email: formData.email })
+        if (step === 'signup-form') {
+          if (!formData.password || !formData.confirmPassword) {
+            setError('Please enter and confirm your password.')
+            return
+          }
+          if (formData.password !== formData.confirmPassword) {
+            setError('Passwords do not match.')
+            return
+          }
+        }
+        if (nextStep === 'otp' && step === 'signup-form') {
+            const normalizedEmail = formData.email.trim().toLowerCase()
+            if (bypassOtpForLocalSignup) {
+              const res = await axios.post(`${API_URL}/api/auth/signup-bypass`, {
+                name: `${formData.firstName} ${formData.lastName}`.trim() || formData.email.split('@')[0],
+                email: normalizedEmail,
+                password: formData.password,
+              })
+              setVerifiedAuth(res.data)
+              nextStep = 'role'
+            } else {
+              await axios.post(`${API_URL}/api/auth/request-otp`, {
+                email: normalizedEmail,
+                name: `${formData.firstName} ${formData.lastName}`.trim(),
+                password: formData.password,
+              })
+            }
+        }
+        if (nextStep === 'verifying') {
+            const normalizedEmail = formData.email.trim().toLowerCase()
+            const res = await axios.post(`${API_URL}/api/auth/login`, {
+              email: normalizedEmail,
+              password: formData.password,
+            })
+            const apiUser = res.data.user
+            const authenticatedApiUser = {
+              ...apiUser,
+              token: res.data.access_token,
+              avatar: `https://i.pravatar.cc/150?u=${apiUser.email}`,
+            }
+            saveLocalUser({
+              ...authenticatedApiUser,
+              password: formData.password,
+            })
+            onAuth(authenticatedApiUser)
+            return
         }
         await new Promise(r => setTimeout(r, delay))
         setStep(nextStep)
-        
-        // If it's a login 'verifying' step, automatically move to dashboard/role after a short delay
-        if (nextStep === 'verifying') {
-            setTimeout(() => {
-                handleFinalAuth('Job Seeker')
-            }, 1500)
-        }
     } catch (err) {
         setError(err.response?.data?.detail || "Connection refused. Please check if backend is running.")
     } finally {
@@ -402,8 +617,16 @@ const AuthModal = ({ mode = 'login', onClose, onAuth }) => {
     setIsLoading(true)
     setError('')
     try {
+        if (bypassOtpForLocalSignup) {
+          // TEMP OTP BYPASS: OTP verification is intentionally skipped for local signup.
+          setStep('role')
+          return
+        }
+        /*
         const res = await axios.post(`${API_URL}/api/auth/verify-otp`, { email: formData.email, otp: otpCode })
+        setVerifiedAuth(res.data)
         // On first verify, we send them to role selection
+        */
         setStep('role')
     } catch (err) {
         setError(err.response?.data?.detail || "Invalid OTP")
@@ -413,56 +636,54 @@ const AuthModal = ({ mode = 'login', onClose, onAuth }) => {
   }
 
   const handleFinalAuth = (role) => {
-    onAuth({ 
-      name: formData.firstName ? `${formData.firstName} ${formData.lastName}` : (formData.email.split('@')[0] || 'User'), 
-      email: formData.email, 
-      role, 
+    const apiUser = verifiedAuth?.user || {}
+    const finalizedUser = { 
+      ...apiUser,
+      name: apiUser.name || (formData.firstName ? `${formData.firstName} ${formData.lastName}` : (formData.email.split('@')[0] || 'User')), 
+      email: apiUser.email || formData.email, 
+      role: apiUser.role || role, 
+      token: verifiedAuth?.access_token,
       avatar: `https://i.pravatar.cc/150?u=${formData.email}`,
-      isEmailVerified: true, 
+      isEmailVerified: true,
       isOnboarded: true // Mark as onboarded so OTP isn't asked again
+    }
+    saveLocalUser({
+      ...finalizedUser,
+      password: formData.password || apiUser.password,
     })
+    onAuth(finalizedUser)
   }
 
-  const SocialButton = ({ icon: Icon, label, color, onClick, brand }) => (
-    <button 
-      onClick={onClick}
-      className="w-full flex items-center justify-center gap-3 py-3 px-4 border border-slate-200 dark:border-slate-800 rounded-lg font-bold bg-white dark:bg-slate-800 text-slate-700 dark:text-white hover:bg-slate-50 dark:hover:bg-slate-700 transition-all text-sm"
-    >
-      {brand === 'google' ? (
-        <svg className="w-5 h-5" viewBox="0 0 24 24">
-          <path fill="#4285F4" d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92c-.26 1.37-1.04 2.53-2.21 3.31v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.09z"/>
-          <path fill="#34A853" d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z"/>
-          <path fill="#FBBC05" d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.07H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.93l3.66-2.84z"/>
-          <path fill="#EA4335" d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.07l3.66 2.84c.87-2.6 3.3-4.53 6.16-4.53z"/>
-        </svg>
-      ) : (
-        <svg className="w-5 h-5" viewBox="0 0 23 23">
-          <path fill="#f3f3f3" d="M0 0h23v23H0z"/>
-          <path fill="#f35325" d="M1 1h10v10H1z"/>
-          <path fill="#81bc06" d="M12 1h10v10H12z"/>
-          <path fill="#05a6f0" d="M1 12h10v10H1z"/>
-          <path fill="#ffba08" d="M12 12h10v10H12z"/>
-        </svg>
-      )}
-      <span>{label}</span>
-    </button>
-  )
+  const handleForgotPassword = async () => {
+    setIsLoading(true)
+    setError('')
+    try {
+      await axios.post(`${API_URL}/api/auth/forgot-password`, { email: formData.email.trim().toLowerCase() })
+      setStep('reset-password')
+    } catch (err) {
+      setError(err.response?.data?.detail || 'Unable to send reset code.')
+    } finally {
+      setIsLoading(false)
+    }
+  }
 
-  const InputField = ({ label, type, placeholder, value, onChange, fullWidth = true, icon: Icon }) => (
-    <div className={`${fullWidth ? 'w-full' : 'w-1/2'} mb-4 text-left`}>
-      <label className="block text-xs font-bold text-slate-500 mb-1 ml-1">{label}</label>
-      <div className="relative">
-        <input 
-          type={type} 
-          placeholder={placeholder}
-          value={value}
-          onChange={onChange}
-          className="w-full px-4 py-3 bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-lg outline-none focus:border-indigo-500 transition-all font-medium text-sm text-slate-900 dark:text-white"
-        />
-        {Icon && <Icon size={16} className="absolute right-4 top-1/2 -translate-y-1/2 text-slate-400 cursor-pointer" onClick={() => setShowPassword(!showPassword)} />}
-      </div>
-    </div>
-  )
+  const handleResetPassword = async () => {
+    setIsLoading(true)
+    setError('')
+    try {
+      await axios.post(`${API_URL}/api/auth/reset-password`, {
+        email: formData.email.trim().toLowerCase(),
+        otp: resetOtp,
+        new_password: newPassword,
+      })
+      setFormData({ ...formData, password: newPassword })
+      setStep('password')
+    } catch (err) {
+      setError(err.response?.data?.detail || 'Unable to reset password.')
+    } finally {
+      setIsLoading(false)
+    }
+  }
 
   return (
     <div className="fixed inset-0 z-[100] bg-slate-50/95 dark:bg-slate-950/95 backdrop-blur-sm flex items-center justify-center p-4 overflow-y-auto">
@@ -473,14 +694,14 @@ const AuthModal = ({ mode = 'login', onClose, onAuth }) => {
 
         <div className="p-10">
           {error && (
-            <motion.div initial={{ opacity: 0, y: -10 }} animate={{ opacity: 1, y: 0 }} className="mb-6 p-4 bg-rose-50 dark:bg-rose-900/20 border border-rose-100 dark:border-rose-800 rounded-xl flex items-center gap-3 text-rose-600 dark:text-rose-400 text-sm font-bold">
+            <MotionDiv initial={{ opacity: 0, y: -10 }} animate={{ opacity: 1, y: 0 }} className="mb-6 p-4 bg-rose-50 dark:bg-rose-900/20 border border-rose-100 dark:border-rose-800 rounded-xl flex items-center gap-3 text-rose-600 dark:text-rose-400 text-sm font-bold">
                <AlertCircle size={18} />
                {error}
-            </motion.div>
+            </MotionDiv>
           )}
           <AnimatePresence mode="wait">
             {step === 'signup-form' && (
-              <motion.div key="signup" initial={{ opacity: 0, scale: 0.95 }} animate={{ opacity: 1, scale: 1 }} exit={{ opacity: 0, scale: 1.05 }} className="text-center">
+              <MotionDiv key="signup" initial={{ opacity: 0, scale: 0.95 }} animate={{ opacity: 1, scale: 1 }} exit={{ opacity: 0, scale: 1.05 }} className="text-center">
                 <div className="flex flex-col items-center gap-2 mb-8">
                   <div className="flex items-center gap-2">
                     <User className="text-indigo-600 bg-indigo-50 dark:bg-indigo-900/30 p-1 rounded-md" size={24} />
@@ -503,8 +724,8 @@ const AuthModal = ({ mode = 'login', onClose, onAuth }) => {
                   <InputField label="Last Name" placeholder="Doe" value={formData.lastName} onChange={e => setFormData({...formData, lastName: e.target.value})} fullWidth={false} />
                 </div>
                 <InputField label="Email" placeholder="your@email.com" value={formData.email} onChange={e => setFormData({...formData, email: e.target.value})} />
-                <InputField label="Password" type={showPassword ? "text" : "password"} icon={showPassword ? EyeOff : Eye} placeholder="••••••••" value={formData.password} onChange={e => setFormData({...formData, password: e.target.value})} />
-                <InputField label="Confirm Password" type={showPassword ? "text" : "password"} icon={showPassword ? EyeOff : Eye} placeholder="••••••••" value={formData.confirmPassword} onChange={e => setFormData({...formData, confirmPassword: e.target.value})} />
+                <InputField label="Password" type={showPassword ? "text" : "password"} icon={showPassword ? EyeOff : Eye} onIconClick={() => setShowPassword(!showPassword)} placeholder="••••••••" value={formData.password} onChange={e => setFormData({...formData, password: e.target.value})} />
+                <InputField label="Confirm Password" type={showPassword ? "text" : "password"} icon={showPassword ? EyeOff : Eye} onIconClick={() => setShowPassword(!showPassword)} placeholder="••••••••" value={formData.confirmPassword} onChange={e => setFormData({...formData, confirmPassword: e.target.value})} />
 
                 <div className="flex items-center gap-3 mb-8 text-left">
                   <input type="checkbox" checked={agreedToTerms} onChange={() => setAgreedToTerms(!agreedToTerms)} className="w-4 h-4 rounded border-slate-200 text-indigo-600 focus:ring-indigo-600 cursor-pointer" />
@@ -523,17 +744,17 @@ const AuthModal = ({ mode = 'login', onClose, onAuth }) => {
                 </div>
 
                 <button 
-                  disabled={!agreedToTerms || !formData.email || isLoading}
+                  disabled={!isSignupReady}
                   onClick={() => handleAction('otp')}
                   className="btn-primary w-full py-4 text-center font-black tracking-wide text-sm disabled:opacity-50"
                 >
                   {isLoading ? <Loader2 size={20} className="mx-auto animate-spin" /> : 'Sign Up'}
                 </button>
-              </motion.div>
+              </MotionDiv>
             )}
 
             {step === 'choice' && (
-              <motion.div key="choice" initial={{ x: 20, opacity: 0 }} animate={{ x: 0, opacity: 1 }} exit={{ x: -20, opacity: 0 }}>
+              <MotionDiv key="choice" initial={{ x: 20, opacity: 0 }} animate={{ x: 0, opacity: 1 }} exit={{ x: -20, opacity: 0 }}>
                 <h3 className="text-3xl font-black mb-2 text-slate-900 dark:text-white">Welcome Back</h3>
                 <p className="text-slate-500 dark:text-slate-400 font-medium mb-10">Select your preferred entry method.</p>
                 <div className="space-y-4 mb-10">
@@ -548,20 +769,33 @@ const AuthModal = ({ mode = 'login', onClose, onAuth }) => {
                    <InputField label="Email Address" type="email" value={formData.email} onChange={e => setFormData({...formData, email: e.target.value})} placeholder="name@company.com" />
                    <button onClick={() => handleAction('password')} className="btn-primary w-full py-4">Continue</button>
                 </div>
-              </motion.div>
+              </MotionDiv>
             )}
 
             {step === 'password' && (
-              <motion.div key="password" initial={{ x: 20, opacity: 0 }} animate={{ x: 0, opacity: 1 }}>
+              <MotionDiv key="password" initial={{ x: 20, opacity: 0 }} animate={{ x: 0, opacity: 1 }}>
                 <h3 className="text-3xl font-black mb-2 text-slate-900 dark:text-white text-center">Secure Access</h3>
                 <p className="text-slate-500 dark:text-slate-400 font-medium mb-10 text-center">{formData.email}</p>
-                <InputField label="Password" type={showPassword ? "text" : "password"} icon={showPassword ? EyeOff : Eye} value={formData.password} onChange={e => setFormData({...formData, password: e.target.value})} />
+                <InputField label="Password" type={showPassword ? "text" : "password"} icon={showPassword ? EyeOff : Eye} onIconClick={() => setShowPassword(!showPassword)} value={formData.password} onChange={e => setFormData({...formData, password: e.target.value})} />
                 <button onClick={() => handleAction('verifying')} className="btn-primary w-full py-4 mt-6">Login</button>
-              </motion.div>
+                <button onClick={handleForgotPassword} className="w-full mt-4 text-sm font-bold text-indigo-600 dark:text-indigo-400">Forgot password?</button>
+              </MotionDiv>
+            )}
+
+            {step === 'reset-password' && (
+              <MotionDiv key="reset-password" initial={{ x: 20, opacity: 0 }} animate={{ x: 0, opacity: 1 }}>
+                <h3 className="text-3xl font-black mb-2 text-slate-900 dark:text-white text-center">Reset Password</h3>
+                <p className="text-slate-500 dark:text-slate-400 font-medium mb-10 text-center">{formData.email}</p>
+                <InputField label="Reset Code" value={resetOtp} onChange={e => setResetOtp(e.target.value)} />
+                <InputField label="New Password" type={showPassword ? "text" : "password"} icon={showPassword ? EyeOff : Eye} onIconClick={() => setShowPassword(!showPassword)} value={newPassword} onChange={e => setNewPassword(e.target.value)} />
+                <button disabled={!resetOtp || !newPassword || isLoading} onClick={handleResetPassword} className="btn-primary w-full py-4 mt-6 disabled:opacity-50">
+                  {isLoading ? <Loader2 size={20} className="mx-auto animate-spin" /> : 'Update Password'}
+                </button>
+              </MotionDiv>
             )}
 
             {step === 'otp' && (
-               <motion.div key="otp" initial={{ opacity: 0, scale: 0.95 }} animate={{ opacity: 1, scale: 1 }} className="text-center">
+               <MotionDiv key="otp" initial={{ opacity: 0, scale: 0.95 }} animate={{ opacity: 1, scale: 1 }} className="text-center">
                  <div className="flex flex-col items-center gap-2 mb-8">
                    <div className="flex items-center gap-2">
                      <div className="w-8 h-8 flex items-center justify-center">
@@ -597,12 +831,12 @@ const AuthModal = ({ mode = 'login', onClose, onAuth }) => {
                  >
                    Submit
                  </button>
-               </motion.div>
+               </MotionDiv>
             )}
 
 
             {step === 'role' && (
-              <motion.div key="role" initial={{ x: 20, opacity: 0 }} animate={{ x: 0, opacity: 1 }}>
+              <MotionDiv key="role" initial={{ x: 20, opacity: 0 }} animate={{ x: 0, opacity: 1 }}>
                 <h3 className="text-3xl font-black mb-8 text-slate-900 dark:text-white text-center">Select Role</h3>
                 <div className="space-y-4">
                   {['Job Seeker', 'Recruiter', 'Admin'].map(r => (
@@ -611,14 +845,14 @@ const AuthModal = ({ mode = 'login', onClose, onAuth }) => {
                     </button>
                   ))}
                 </div>
-              </motion.div>
+              </MotionDiv>
             )}
             
             {step === 'verifying' && (
-              <motion.div key="verifying" className="text-center py-20">
+              <MotionDiv key="verifying" className="text-center py-20">
                 <Loader2 size={40} className="mx-auto animate-spin text-indigo-600 mb-6" />
                 <h3 className="text-xl font-black">Syncing Protocols...</h3>
-              </motion.div>
+              </MotionDiv>
             )}
           </AnimatePresence>
         </div>
@@ -654,65 +888,57 @@ const JobDetailView = ({ job, onBack }) => (
     <button onClick={onBack} className="flex items-center gap-2 text-indigo-600 dark:text-indigo-400 font-bold mb-8 hover:gap-3 transition-all">
       <ArrowRight size={20} className="rotate-180" /> Back to Dashboard
     </button>
-    
+
     <div className="glass-card dark:bg-slate-900/50 dark:border-slate-800 mb-8 overflow-hidden !p-0">
-      <div className={`p-4 text-center font-black uppercase tracking-widest text-white ${job.score > 60 ? 'bg-rose-500' : (job.score > 30 ? 'bg-amber-500' : 'bg-emerald-500')}`}>
-        {job.score > 60 ? '⚠️ High Energy Sink - Avoid' : (job.score > 30 ? '🟡 Moderate Sink - Apply Cautiously' : '✅ Verified Lead - Apply Confidently')}
+      <div className={`p-4 text-center font-black uppercase tracking-widest text-white ${job.scoreStatus !== 'scored' ? 'bg-slate-500' : (job.energySinkScore >= 70 ? 'bg-rose-500' : (job.energySinkScore >= 40 ? 'bg-amber-500' : 'bg-emerald-500'))}`}>
+        {formatRecommendation(job)}
       </div>
       <div className="p-8 flex flex-col md:flex-row justify-between items-start md:items-center gap-6">
         <div>
-          <h2 className="text-3xl font-black text-slate-900 dark:text-white mb-2">{job.company_name}</h2>
-          <p className="text-xl text-slate-600 dark:text-slate-400 font-bold">{job.title}</p>
+          <h2 className="text-3xl font-black text-slate-900 dark:text-white mb-2">{job.companyName}</h2>
+          <p className="text-xl text-slate-600 dark:text-slate-400 font-bold">{job.jobTitle}</p>
         </div>
-        <div className="flex items-center gap-6">
-          <div className="text-right">
-            <p className="text-[10px] font-bold text-slate-400 uppercase">Trust Score</p>
-            <p className={`text-2xl font-black ${job.ai_score > 70 ? 'text-indigo-600' : 'text-rose-600'}`}>{job.ai_score}%</p>
-          </div>
-          <EnergySinkGauge score={job.score} />
-        </div>
+        <EnergySinkGauge score={job.scoreStatus === 'scored' ? Math.round(job.energySinkScore) : 0} />
       </div>
     </div>
 
     <div className="grid md:grid-cols-2 gap-8">
       <div className="glass-card dark:bg-slate-900/50 dark:border-slate-800">
-        <h3 className="font-bold text-slate-400 dark:text-slate-500 uppercase text-xs tracking-widest mb-6 flex items-center gap-2">
-          <Zap size={14} className="text-amber-500" /> Effort Triggers (AESD Engine)
-        </h3>
+        <h3 className="font-bold text-slate-400 dark:text-slate-500 uppercase text-xs tracking-widest mb-6">Effort Metrics</h3>
         <div className="space-y-4">
-           <div className="flex justify-between items-center text-sm font-bold">
-             <span className="text-slate-600 dark:text-slate-400">Manual Field Inputs</span>
-             <span className="text-rose-500">+12 Fields</span>
-           </div>
-           <div className="flex justify-between items-center text-sm font-bold">
-             <span className="text-slate-600 dark:text-slate-400">ATS Redirect Chain</span>
-             <span className="text-amber-500">2 Redirects</span>
-           </div>
-           <div className="flex justify-between items-center text-sm font-bold">
-             <span className="text-slate-600 dark:text-slate-400">Custom Resume Formatting</span>
-             <span className="text-emerald-500">Not Required</span>
-           </div>
-           <div className="pt-4 border-t border-slate-100 dark:border-slate-800 flex justify-between items-center font-black">
-             <span className="text-slate-900 dark:text-white">Total Effort Index</span>
-             <span className="text-indigo-600">450 pts</span>
-           </div>
+          <div className="flex justify-between items-center text-sm font-bold">
+            <span className="text-slate-600 dark:text-slate-400">Time Spent</span>
+            <span className="text-indigo-600">{job.totalTimeSpent}s</span>
+          </div>
+          <div className="flex justify-between items-center text-sm font-bold">
+            <span className="text-slate-600 dark:text-slate-400">Max Scroll Depth</span>
+            <span className="text-amber-500">{job.maxScrollDepth}</span>
+          </div>
+          <div className="flex justify-between items-center text-sm font-bold">
+            <span className="text-slate-600 dark:text-slate-400">Apply Clicks</span>
+            <span className="text-rose-500">{job.applyClicks}</span>
+          </div>
+          <div className="pt-4 border-t border-slate-100 dark:border-slate-800 flex justify-between items-center font-black">
+            <span className="text-slate-900 dark:text-white">Effort Score</span>
+            <span className="text-indigo-600">{job.effortScore}</span>
+          </div>
         </div>
       </div>
       <div className="glass-card dark:bg-slate-900/50 dark:border-slate-800">
         <h3 className="font-bold text-slate-400 dark:text-slate-500 uppercase text-xs tracking-widest mb-6">Response Metrics</h3>
         <div className="space-y-4">
-           <div className="flex justify-between items-center text-sm font-bold">
-             <span className="text-slate-600 dark:text-slate-400">Response Rate</span>
-             <span className="text-rose-500">8%</span>
-           </div>
-           <div className="flex justify-between items-center text-sm font-bold">
-             <span className="text-slate-600 dark:text-slate-400">Avg. Response Time</span>
-             <span className="text-slate-900 dark:text-white">24 Days</span>
-           </div>
-           <div className="flex justify-between items-center text-sm font-bold">
-             <span className="text-slate-600 dark:text-slate-400">Active Signals</span>
-             <span className="text-emerald-500">Low</span>
-           </div>
+          <div className="flex justify-between items-center text-sm font-bold">
+            <span className="text-slate-600 dark:text-slate-400">Response Score</span>
+            <span className="text-emerald-500">{job.responseScore}</span>
+          </div>
+          <div className="flex justify-between items-center text-sm font-bold">
+            <span className="text-slate-600 dark:text-slate-400">Delay Penalty</span>
+            <span className="text-slate-900 dark:text-white">{job.delayPenalty ?? 0}</span>
+          </div>
+          <div className="flex justify-between items-center text-sm font-bold">
+            <span className="text-slate-600 dark:text-slate-400">Last Interaction</span>
+            <span className="text-slate-900 dark:text-white">{formatTimestamp(job.lastInteractionTime)}</span>
+          </div>
         </div>
       </div>
     </div>
@@ -755,7 +981,17 @@ const OnboardingView = ({ onComplete }) => (
   </div>
 )
 
-const EmployerDashboard = () => (
+const EmployerDashboard = ({ user }) => {
+  const [data, setData] = useState(null)
+
+  useEffect(() => {
+    if (!user?.token) return
+    axios.get(`${API_URL}/api/employer/dashboard`, { headers: getAuthHeaders(user.token) })
+      .then(res => setData(res.data))
+      .catch(() => setData(null))
+  }, [user?.token])
+
+  return (
   <div className="pt-24 px-6 max-w-7xl mx-auto">
     <div className="flex items-center justify-between mb-12">
       <div>
@@ -767,19 +1003,113 @@ const EmployerDashboard = () => (
     <div className="grid md:grid-cols-3 gap-8">
        <div className="glass-card dark:bg-slate-900/50">
           <h4 className="text-xs font-black text-slate-400 uppercase tracking-widest mb-4">Trust Rating</h4>
-          <div className="text-4xl font-black text-emerald-500">Tier A</div>
+          <div className="text-4xl font-black text-emerald-500">{data?.trustRating || 'Needs Data'}</div>
        </div>
        <div className="glass-card dark:bg-slate-900/50">
           <h4 className="text-xs font-black text-slate-400 uppercase tracking-widest mb-4">Active Applicants</h4>
-          <div className="text-4xl font-black text-indigo-500">1.2k</div>
+          <div className="text-4xl font-black text-indigo-500">{data?.activeApplicants ?? 0}</div>
        </div>
        <div className="glass-card dark:bg-slate-900/50">
           <h4 className="text-xs font-black text-slate-400 uppercase tracking-widest mb-4">Response Velocity</h4>
-          <div className="text-4xl font-black text-slate-900 dark:text-white">2.4 Days</div>
+          <div className="text-4xl font-black text-slate-900 dark:text-white">{data?.responseVelocityDays ?? 0} Days</div>
        </div>
     </div>
   </div>
 )
+}
+
+const AdminDashboard = ({ user }) => {
+  const [data, setData] = useState(null)
+
+  useEffect(() => {
+    if (!user?.token) return
+    axios.get(`${API_URL}/api/admin/dashboard`, { headers: getAuthHeaders(user.token) })
+      .then(res => setData(res.data))
+      .catch(() => setData(null))
+  }, [user?.token])
+
+  return (
+    <div className="pt-24 px-6 max-w-7xl mx-auto">
+      <h2 className="text-3xl font-black text-slate-900 dark:text-white mb-12">Admin Control Center</h2>
+      <div className="grid md:grid-cols-3 gap-8">
+        <div className="glass-card dark:bg-slate-900/50"><h4 className="text-xs font-black text-slate-400 uppercase tracking-widest mb-4">Users</h4><div className="text-4xl font-black text-indigo-500">{data?.users ?? 0}</div></div>
+        <div className="glass-card dark:bg-slate-900/50"><h4 className="text-xs font-black text-slate-400 uppercase tracking-widest mb-4">Signals</h4><div className="text-4xl font-black text-emerald-500">{data?.signals ?? 0}</div></div>
+        <div className="glass-card dark:bg-slate-900/50"><h4 className="text-xs font-black text-slate-400 uppercase tracking-widest mb-4">Tracked Jobs</h4><div className="text-4xl font-black text-slate-900 dark:text-white">{data?.trackedJobs ?? 0}</div></div>
+      </div>
+    </div>
+  )
+}
+
+const IntegrationsView = ({ user, isEmailSynced, setIsEmailSynced }) => {
+  const [headersText, setHeadersText] = useState('')
+  const [status, setStatus] = useState('')
+  const [isLoading, setIsLoading] = useState(false)
+
+  const parseHeaders = () => {
+    if (!headersText.trim()) {
+      return []
+    }
+    return headersText.split('\n').map((line) => {
+      const [from = '', subject = ''] = line.split('|')
+      return { from: from.trim(), subject: subject.trim() }
+    }).filter((header) => header.from || header.subject)
+  }
+
+  const connectGmail = async () => {
+    if (!user?.token) {
+      setStatus('Login required')
+      return
+    }
+    setIsLoading(true)
+    setStatus('')
+    try {
+      const res = await axios.post(
+        `${API_URL}/api/integrations/gmail/connect`,
+        { headers: parseHeaders() },
+        { headers: getAuthHeaders(user.token) },
+      )
+      setIsEmailSynced(true)
+      setStatus(`Connected. ${res.data.signal_count || 0} email signals detected.`)
+    } catch (error) {
+      setStatus(error.response?.data?.detail || 'Unable to connect Gmail analysis.')
+    } finally {
+      setIsLoading(false)
+    }
+  }
+
+  return (
+    <div className="pt-32 px-6 max-w-2xl mx-auto">
+      <h2 className="text-3xl font-black mb-8 dark:text-white">Connection Suite</h2>
+      <div className="glass-card dark:bg-slate-900/50">
+        <div className="flex items-center justify-between gap-6">
+          <div className="flex items-center gap-4">
+             <div className="w-12 h-12 bg-indigo-50 dark:bg-indigo-900/30 rounded-xl flex items-center justify-center text-indigo-600">
+                <Mail size={24} />
+             </div>
+             <div>
+                <h4 className="font-bold dark:text-white">Direct Email Relay</h4>
+                <p className="text-xs text-slate-500 font-medium">Analyzes only sender and subject headers for response tracking.</p>
+             </div>
+          </div>
+          <button
+            onClick={() => isEmailSynced ? setIsEmailSynced(false) : connectGmail()}
+            disabled={isLoading}
+            className={`px-6 py-2 rounded-lg font-bold text-sm transition-all disabled:opacity-50 ${isEmailSynced ? 'bg-rose-50 dark:bg-rose-900/20 text-rose-600' : 'bg-indigo-600 text-white'}`}
+          >
+            {isLoading ? 'Connecting...' : (isEmailSynced ? 'Disconnect' : 'Connect Gmail')}
+          </button>
+        </div>
+        <textarea
+          value={headersText}
+          onChange={(event) => setHeadersText(event.target.value)}
+          placeholder="sender@example.com | Interview invitation"
+          className="mt-6 w-full min-h-28 px-4 py-3 rounded-xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-950 text-sm outline-none focus:border-indigo-500"
+        />
+        {status && <p className="mt-4 text-sm font-bold text-slate-600 dark:text-slate-300">{status}</p>}
+      </div>
+    </div>
+  )
+}
 
 const PrivacyPage = () => (
   <div className="pt-32 px-6 max-w-3xl mx-auto pb-32">
@@ -804,25 +1134,20 @@ const PrivacyPage = () => (
 )
 
 function App() {
-  const [user, setUser] = useState(null)
+  const [user, setUser] = useState(() => getStoredSessionUser())
   const [activeTab, setActiveTab] = useState('home')
   const [selectedJob, setSelectedJob] = useState(null)
+  const [extensionLoginPrompt, setExtensionLoginPrompt] = useState(false)
   const [theme, setTheme] = useState(() => {
     const saved = localStorage.getItem('theme')
     console.log("Initial theme from storage:", saved)
     return saved === 'dark' ? 'dark' : 'light'
   })
-  const [jobs] = useState([
-    { id: 101, title: 'Senior Product Designer', company_name: 'Meta Platforms', score: 18, ai_score: 95, status: 'Active' },
-    { id: 102, title: 'Staff Engineer', company_name: 'Stripe', score: 42, ai_score: 88, status: 'Slow' },
-    { id: 103, title: 'Frontend Developer', company_name: 'ABC Corp', score: 72, ai_score: 22, status: 'Ghosted' }
-  ])
-  const [personalStats] = useState({
-    effortIndex: 450,
-    yield: 12,
-    timeWasted: 24,
-    activeLeads: 3
-  })
+  const [jobs, setJobs] = useState([])
+  const [analytics, setAnalytics] = useState({})
+  const [dashboardError, setDashboardError] = useState('')
+  const [lastUpdated, setLastUpdated] = useState(null)
+  const [signalStats, setSignalStats] = useState({ signalCount: 0, latestScore: 0 })
   const [isEmailSynced, setIsEmailSynced] = useState(false)
 
   const toggleTheme = () => {
@@ -840,9 +1165,90 @@ function App() {
     }
   }, [theme])
 
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search)
+    if (params.get('source') === 'extension' && !user) {
+      setExtensionLoginPrompt(true)
+      setActiveTab('login')
+    }
+  }, [user])
+
+  useEffect(() => {
+    if (!user) {
+      return
+    }
+    const roleRoute = user.role === 'Recruiter' ? 'employer-dashboard' :
+      user.role === 'Admin' ? 'admin-dashboard' : 'dashboard'
+    setActiveTab(roleRoute)
+  }, [user])
+
+  const loadDashboardData = useCallback(async () => {
+    if (!user?.token) {
+      setJobs([])
+      setAnalytics({})
+      setLastUpdated(null)
+      setSignalStats({ signalCount: 0, latestScore: 0 })
+      return
+    }
+
+    const headers = getAuthHeaders(user.token)
+    const [dashboardRes, analyticsRes] = await Promise.all([
+      axios.get(`${API_URL}/api/dashboard`, { headers }),
+      axios.get(`${API_URL}/api/analytics`, { headers }),
+    ])
+    setJobs(dashboardRes.data.jobs || [])
+    setAnalytics(analyticsRes.data || {})
+    setSignalStats({
+      signalCount: dashboardRes.data.signalCount ?? analyticsRes.data.signalCount ?? 0,
+      latestScore: dashboardRes.data.latestScore ?? 0,
+    })
+    setLastUpdated(dashboardRes.data.lastUpdated || analyticsRes.data.lastUpdated || null)
+    setDashboardError('')
+  }, [user?.token])
+
+  useEffect(() => {
+    if (!user?.token) {
+      loadDashboardData()
+      return
+    }
+
+    let cancelled = false
+
+    const loadData = async () => {
+      try {
+        if (!cancelled) {
+          await loadDashboardData()
+        }
+      } catch (error) {
+        if (!cancelled) {
+          if (error.response?.status === 401) {
+            setDashboardError('Unauthorized user')
+            setUser(null)
+            clearSessionUser()
+            setActiveTab('login')
+          } else {
+            setDashboardError('Backend not connected')
+          }
+        }
+      }
+    }
+
+    loadData()
+    const handleFocus = () => loadData()
+    window.addEventListener('focus', handleFocus)
+    const intervalId = window.setInterval(loadData, 10000)
+    return () => {
+      cancelled = true
+      window.removeEventListener('focus', handleFocus)
+      window.clearInterval(intervalId)
+    }
+  }, [user?.token, loadDashboardData])
+
   const handleAuth = (userData) => {
     console.log("Authenticated User:", userData)
     setUser(userData)
+    setExtensionLoginPrompt(false)
+    saveSessionUser(userData)
     
     // START INTELLIGENT ROUTING
     if (!userData.isEmailVerified) {
@@ -858,6 +1264,7 @@ function App() {
 
   const handleSignOut = () => {
     setUser(null)
+    clearSessionUser()
     setActiveTab('home')
     setSelectedJob(null)
   }
@@ -867,37 +1274,40 @@ function App() {
       <Nav user={user} activeTab={activeTab} setActiveTab={setActiveTab} onSignOut={handleSignOut} theme={theme} toggleTheme={toggleTheme} />
       
       <main className="animate-in">
-        {activeTab === 'home' && <LandingPage onGetStarted={() => user ? handleAuth(user) : setActiveTab('login')} setActiveTab={setActiveTab} />}
-        {activeTab === 'dashboard' && !selectedJob && <Dashboard jobs={jobs} onSelectJob={setSelectedJob} onNavigateToAnalytics={() => setActiveTab('analytics')} />}
-        {activeTab === 'analytics' && <PersonalAnalytics jobs={jobs} />}
-        {activeTab === 'leaderboard' && <CommunityLeaderboard />}
-        {activeTab === 'employer-dashboard' && <EmployerDashboard />}
-        {activeTab === 'admin-dashboard' && <div className="pt-32 text-center font-black text-4xl dark:text-white">Admin Control Center</div>}
-        {activeTab === 'verify-email' && <VerifyEmailView email={user?.email} onVerify={() => handleAuth({...user, isEmailVerified: true})} />}
-        {activeTab === 'onboarding' && <OnboardingView onComplete={() => handleAuth({...user, isOnboarded: true})} />}
-        {activeTab === 'dashboard' && selectedJob && <JobDetailView job={selectedJob} onBack={() => setSelectedJob(null)} />}
-        {activeTab === 'integrations' && (
-          <div className="pt-32 px-6 max-w-2xl mx-auto">
-            <h2 className="text-3xl font-black mb-8 dark:text-white">Connection Suite</h2>
-            <div className="glass-card dark:bg-slate-900/50 flex items-center justify-between">
-              <div className="flex items-center gap-4">
-                 <div className="w-12 h-12 bg-indigo-50 dark:bg-indigo-900/30 rounded-xl flex items-center justify-center text-indigo-600">
-                    <Mail size={24} />
-                 </div>
-                 <div>
-                    <h4 className="font-bold dark:text-white">Direct Email Relay (Passive)</h4>
-                    <p className="text-xs text-slate-500 font-medium">Syncs only 'From' and 'Subject' headers for automated tracking.</p>
-                 </div>
-              </div>
-              <button 
-                onClick={() => setIsEmailSynced(!isEmailSynced)}
-                className={`px-6 py-2 rounded-lg font-bold text-sm transition-all ${isEmailSynced ? 'bg-rose-50 dark:bg-rose-900/20 text-rose-600' : 'bg-indigo-600 text-white'}`}
-              >
-                {isEmailSynced ? 'Disconnect' : 'Connect Gmail'}
-              </button>
+        {extensionLoginPrompt && activeTab === 'login' && (
+          <div className="pt-24 px-6 max-w-2xl mx-auto">
+            <div className="mb-4 p-4 bg-indigo-50 dark:bg-indigo-900/20 border border-indigo-100 dark:border-indigo-800 rounded-xl text-indigo-700 dark:text-indigo-300 text-sm font-bold">
+              Login to connect your AESD Extension
             </div>
           </div>
         )}
+        {activeTab === 'home' && <LandingPage onGetStarted={() => user ? handleAuth(user) : setActiveTab('login')} setActiveTab={setActiveTab} />}
+        {dashboardError && activeTab === 'dashboard' && (
+          <div className="pt-24 px-6 max-w-7xl mx-auto">
+            <div className="mb-4 p-4 bg-amber-50 dark:bg-amber-900/20 border border-amber-100 dark:border-amber-800 rounded-xl text-amber-700 dark:text-amber-300 text-sm font-bold">
+              {dashboardError}
+            </div>
+          </div>
+        )}
+        {activeTab === 'dashboard' && !selectedJob && (
+          <Dashboard
+            jobs={jobs}
+            onSelectJob={setSelectedJob}
+            onNavigateToAnalytics={() => setActiveTab('analytics')}
+            onRefresh={loadDashboardData}
+            lastUpdated={lastUpdated}
+            signalCount={signalStats.signalCount}
+            latestScore={signalStats.latestScore}
+          />
+        )}
+        {activeTab === 'analytics' && <PersonalAnalytics analytics={analytics} lastUpdated={lastUpdated} />}
+        {activeTab === 'leaderboard' && <CommunityLeaderboard user={user} />}
+        {activeTab === 'employer-dashboard' && <EmployerDashboard user={user} />}
+        {activeTab === 'admin-dashboard' && <AdminDashboard user={user} />}
+        {activeTab === 'verify-email' && <VerifyEmailView email={user?.email} onVerify={() => handleAuth({...user, isEmailVerified: true})} />}
+        {activeTab === 'onboarding' && <OnboardingView onComplete={() => handleAuth({...user, isOnboarded: true})} />}
+        {activeTab === 'dashboard' && selectedJob && <JobDetailView job={selectedJob} onBack={() => setSelectedJob(null)} />}
+        {activeTab === 'integrations' && <IntegrationsView user={user} isEmailSynced={isEmailSynced} setIsEmailSynced={setIsEmailSynced} />}
         {activeTab === 'how-it-works' && <HowItWorks />}
         {activeTab === 'privacy' && <PrivacyPage />}
         {activeTab === 'about' && (

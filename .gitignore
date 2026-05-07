@@ -1,0 +1,92 @@
+# Environment Variables
+.env
+.env.local
+.env.*.local
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+.venv/
+venv/
+ENV/
+env/
+.venv
+
+# Node/npm (legacy)
+node_modules/
+package-lock.json
+npm-debug.log
+yarn-error.log
+.npm
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+*.sublime-project
+*.sublime-workspace
+
+# ML Models and Data Files
+*.pkl
+*.joblib
+*.h5
+*.pt
+*.pth
+*.model
+
+# Database Files
+*.db
+*.sqlite
+*.sqlite3
+
+# User/Local Data
+users.json
+sample_dataset.json
+*_demo.db
+*_local.*
+
+# Frontend Build
+frontend/dist/
+
+# Build outputs
+out/
+build_output/
+
+# Database
+*.db
+*.sqlite
+*.sqlite3
+
+# Logs
+logs/
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Temporary files
+*.tmp
+*.temp

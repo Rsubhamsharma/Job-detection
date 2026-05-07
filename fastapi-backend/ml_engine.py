@@ -2,13 +2,14 @@ import pandas as pd
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.ensemble import RandomForestClassifier
 import pickle
-import os
+from pathlib import Path
 
 # This is a simplified ML model for Job Authenticity Detection
 # In a real scenario, this would be trained on the EMSI or Kaggle Fake Jobs dataset
 
-MODEL_PATH = "job_model.pkl"
-VECTORIZER_PATH = "vectorizer.pkl"
+BASE_DIR = Path(__file__).resolve().parent
+MODEL_PATH = BASE_DIR / "job_model.pkl"
+VECTORIZER_PATH = BASE_DIR / "vectorizer.pkl"
 
 def train_mock_model():
     """Simulates training a model on a job dataset."""
@@ -40,7 +41,7 @@ def train_mock_model():
 
 def predict_authenticity(job_description: str) -> float:
     """Predicts the probability of a job being real."""
-    if not os.path.exists(MODEL_PATH):
+    if not MODEL_PATH.exists() or not VECTORIZER_PATH.exists():
         train_mock_model()
         
     with open(MODEL_PATH, 'rb') as f:

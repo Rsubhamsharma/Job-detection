@@ -73,9 +73,12 @@ const getAuthHeaders = (token) => (
 )
 
 const formatTimestamp = (value) => {
-  if (!value) return 'No data yet'
-  const date = new Date(value)
-  if (Number.isNaN(date.getTime())) return 'No data yet'
+  if (!value) return 'Not updated yet'
+  const numeric = Number(value)
+  const date = Number.isFinite(numeric) && numeric > 0
+    ? new Date(numeric < 10000000000 ? numeric * 1000 : numeric)
+    : new Date(value)
+  if (Number.isNaN(date.getTime()) || date.getFullYear() < 2020) return 'Not updated yet'
   return date.toLocaleString()
 }
 
@@ -95,8 +98,23 @@ const formatEffortResponse = (job) => {
   if (job?.scoreStatus !== 'scored' && effort === 0) {
     return 'Not enough effort data'
   }
-  return `Effort ${effort} | Response ${response > 0 ? response : 'pending'}`
+  return `Effort ${effort} | ${formatResponseStatus(job)}`
 }
+
+const formatResponseStatus = (job) => ({
+  acknowledged: 'Response acknowledged',
+  application_acknowledged: 'Response acknowledged',
+  interview: 'Interview detected',
+  interview_detected: 'Interview detected',
+  rejection: 'Rejected',
+  rejection_detected: 'Rejected',
+  rejected: 'Rejected',
+  offer: 'Offer detected',
+  offer_detected: 'Offer detected',
+  no_response: 'No response',
+  no_response_after_delay: 'No response',
+  pending: 'Response pending',
+}[job?.responseStatus || 'pending'] || 'Response pending')
 
 const formatRecommendation = (job) => {
   const scoreStatus = job?.scoreStatus || 'not_enough_effort_data'
@@ -136,20 +154,65 @@ const getScoreDotClass = (job) => {
   return 'bg-emerald-500'
 }
 
+const buildAnalyticsFromJobs = (jobs = [], signalCount = 0, lastUpdated = null) => {
+  const validJobs = jobs.filter(job => job?.jobId && (job.effortScore > 0 || String(job.jobId).startsWith('linkedin:')))
+  const numericJobs = validJobs.filter(job => typeof job.energySinkScore === 'number')
+  const responded = validJobs.filter(job => !['pending', '', null, undefined].includes(job.responseStatus))
+  const totalApplications = validJobs.length
+  const averageEnergyScore = numericJobs.length
+    ? Math.round((numericJobs.reduce((sum, job) => sum + job.energySinkScore, 0) / numericJobs.length) * 10) / 10
+    : 0
+  const averageResponseRate = totalApplications ? Math.round((responded.length / totalApplications) * 100) : 0
+  const grouped = numericJobs.reduce((acc, job) => {
+    const companyName = job.companyName || job.company || 'Unknown'
+    acc[companyName] = acc[companyName] || []
+    acc[companyName].push(job)
+    return acc
+  }, {})
+  const ranked = Object.entries(grouped).map(([companyName, rows]) => ({
+    companyName,
+    jobTitle: rows[0]?.jobTitle,
+    energySinkScore: Math.round((rows.reduce((sum, job) => sum + job.energySinkScore, 0) / rows.length) * 10) / 10,
+    applicationCount: rows.length,
+  })).sort((a, b) => b.energySinkScore - a.energySinkScore)
+  return {
+    totalApplications,
+    averageResponseRate,
+    averageEnergyScore,
+    topRiskyCompanies: ranked.slice(0, 5),
+    bestCompanies: [...ranked].reverse().slice(0, 5),
+    signalCount,
+    lastUpdated,
+    summary: {
+      averageEffort: totalApplications ? Math.round((validJobs.reduce((sum, job) => sum + (job.effortScore || 0), 0) / totalApplications) * 10) / 10 : 0,
+      responseCount: responded.length,
+      pendingResponseCount: Math.max(totalApplications - responded.length, 0),
+    },
+  }
+}
+
 // --- COMPONENTS ---
 
 const Nav = ({ user, activeTab, setActiveTab, onSignOut, theme, toggleTheme }) => (
   <nav className="fixed top-0 left-0 right-0 h-16 bg-white/80 dark:bg-slate-950/80 backdrop-blur-md border-b border-slate-200 dark:border-slate-800 z-50 px-6 flex items-center justify-between transition-colors duration-300">
-    <div className="flex items-center gap-2 cursor-pointer" onClick={() => setActiveTab('home')}>
+    <div className="flex items-center gap-2 cursor-pointer" onClick={() => setActiveTab(user ? 'dashboard' : 'home')}>
       <div className="w-8 h-8 bg-indigo-600 rounded-lg flex items-center justify-center text-white font-bold italic">JZ</div>
       <span className="font-extrabold text-xl tracking-tight text-slate-900 dark:text-white">JobZoid</span>
     </div>
     
     <div className="hidden md:flex items-center gap-8">
-      <button onClick={() => setActiveTab('home')} className={`text-sm font-semibold transition-colors ${activeTab === 'home' ? 'text-indigo-600' : 'text-slate-600 dark:text-slate-400 hover:text-indigo-600'}`}>Home</button>
-      <button onClick={() => setActiveTab('how-it-works')} className={`text-sm font-semibold transition-colors ${activeTab === 'how-it-works' ? 'text-indigo-600' : 'text-slate-600 dark:text-slate-400 hover:text-indigo-600'}`}>How It Works</button>
-      {user && <button onClick={() => setActiveTab('dashboard')} className={`text-sm font-semibold transition-colors ${activeTab === 'dashboard' ? 'text-indigo-600' : 'text-slate-600 dark:text-slate-400 hover:text-indigo-600'}`}>Dashboard</button>}
-      <button onClick={() => setActiveTab('about')} className={`text-sm font-semibold transition-colors ${activeTab === 'about' ? 'text-indigo-600' : 'text-slate-600 dark:text-slate-400 hover:text-indigo-600'}`}>About</button>
+      {user ? (
+        <>
+          <button onClick={() => setActiveTab('dashboard')} className={`text-sm font-semibold transition-colors ${activeTab === 'dashboard' ? 'text-indigo-600' : 'text-slate-600 dark:text-slate-400 hover:text-indigo-600'}`}>Dashboard</button>
+          <button onClick={() => setActiveTab('analytics')} className={`text-sm font-semibold transition-colors ${activeTab === 'analytics' ? 'text-indigo-600' : 'text-slate-600 dark:text-slate-400 hover:text-indigo-600'}`}>Analytics</button>
+        </>
+      ) : (
+        <>
+          <button onClick={() => setActiveTab('home')} className={`text-sm font-semibold transition-colors ${activeTab === 'home' ? 'text-indigo-600' : 'text-slate-600 dark:text-slate-400 hover:text-indigo-600'}`}>Home</button>
+          <button onClick={() => setActiveTab('how-it-works')} className={`text-sm font-semibold transition-colors ${activeTab === 'how-it-works' ? 'text-indigo-600' : 'text-slate-600 dark:text-slate-400 hover:text-indigo-600'}`}>How It Works</button>
+          <button onClick={() => setActiveTab('about')} className={`text-sm font-semibold transition-colors ${activeTab === 'about' ? 'text-indigo-600' : 'text-slate-600 dark:text-slate-400 hover:text-indigo-600'}`}>About</button>
+        </>
+      )}
     </div>
 
     <div className="flex items-center gap-4">
@@ -319,7 +382,8 @@ const LandingPage = ({ onGetStarted, setActiveTab }) => (
 
 const PersonalAnalytics = ({ analytics, lastUpdated }) => {
   const chartData = [
-    { name: 'Applications', effort: analytics.totalApplications || 0, responses: analytics.averageResponseRate || 0 },
+    { name: 'Applications', effort: analytics.totalApplications || 0, responses: analytics.summary?.responseCount || 0 },
+    { name: 'Effort', effort: analytics.summary?.averageEffort || 0, responses: analytics.summary?.pendingResponseCount || 0 },
     { name: 'Average', effort: analytics.averageEnergyScore || 0, responses: analytics.averageResponseRate || 0 },
   ]
 
@@ -403,7 +467,55 @@ const PersonalAnalytics = ({ analytics, lastUpdated }) => {
   )
 }
 
-const Dashboard = ({ jobs, onSelectJob, onNavigateToAnalytics, onRefresh, lastUpdated, signalCount, latestScore }) => (
+const RESPONSE_ACTIONS = [
+  ['interview_detected', 'Interview'],
+  ['rejection_detected', 'Rejected'],
+  ['offer_detected', 'Offer'],
+  ['no_response_after_delay', 'No Response'],
+  ['application_acknowledged', 'Acknowledged'],
+]
+
+const ResponseDropdown = ({ job, onResponse, loading, error }) => {
+  const [open, setOpen] = useState(false)
+  const label = job?.responseStatus && job.responseStatus !== 'pending'
+    ? `Response: ${formatResponseStatus(job).replace('Response ', '')}`
+    : 'Response'
+
+  const select = async (type) => {
+    setOpen(false)
+    await onResponse(job, type)
+  }
+
+  return (
+    <div className="relative inline-flex">
+      <button
+        type="button"
+        disabled={loading}
+        onClick={() => setOpen(v => !v)}
+        className="inline-flex items-center gap-1 rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-2 text-xs font-black text-slate-700 dark:text-slate-200 shadow-sm hover:border-indigo-300 hover:text-indigo-600 dark:hover:border-indigo-500 disabled:opacity-60 whitespace-nowrap"
+      >
+        {loading ? 'Saving...' : label} <span className="text-slate-400">▾</span>
+      </button>
+      {open && (
+        <div className="absolute right-0 top-full z-50 mt-2 w-44 overflow-hidden rounded-xl border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-950 shadow-xl">
+          {RESPONSE_ACTIONS.map(([type, optionLabel]) => (
+            <button
+              key={type}
+              type="button"
+              onClick={() => select(type)}
+              className="block w-full px-4 py-2.5 text-left text-xs font-bold text-slate-700 dark:text-slate-200 hover:bg-indigo-50 hover:text-indigo-600 dark:hover:bg-slate-800 whitespace-nowrap"
+            >
+              Mark {optionLabel}
+            </button>
+          ))}
+        </div>
+      )}
+      {error && <div className="absolute right-0 top-full mt-12 w-44 text-left text-[11px] font-bold text-rose-500">Could not update response</div>}
+    </div>
+  )
+}
+
+const Dashboard = ({ jobs, onSelectJob, onNavigateToAnalytics, onRefresh, onResponse, lastUpdated, signalCount, latestScore }) => (
   <div className="pt-24 px-6 max-w-7xl mx-auto">
     <div className="flex flex-col md:flex-row md:items-center justify-between gap-6 mb-12">
       <div>
@@ -419,7 +531,7 @@ const Dashboard = ({ jobs, onSelectJob, onNavigateToAnalytics, onRefresh, lastUp
       </div>
     </div>
 
-    <div className="glass-card overflow-hidden !p-0 border-slate-200 dark:border-slate-800 dark:bg-slate-900/50">
+    <div className="glass-card overflow-visible !p-0 border-slate-200 dark:border-slate-800 dark:bg-slate-900/50">
       <table className="w-full text-left">
         <thead className="bg-slate-50 dark:bg-slate-800/50 border-b border-slate-200 dark:border-slate-800">
           <tr>
@@ -449,7 +561,10 @@ const Dashboard = ({ jobs, onSelectJob, onNavigateToAnalytics, onRefresh, lastUp
                 <span className={`text-xs font-bold px-2 py-1 rounded uppercase whitespace-nowrap ${getRecommendationClass(j)}`}>{formatRecommendation(j)}</span>
               </td>
               <td className="px-8 py-6 text-right">
-                <button onClick={() => onSelectJob(j)} className="text-indigo-600 dark:text-indigo-400 font-bold text-sm hover:underline transition-all">View</button>
+                <div className="flex items-center justify-end gap-3">
+                  <ResponseDropdown job={j} onResponse={onResponse} loading={j.responseUpdating} error={j.responseError} />
+                  <button onClick={() => onSelectJob(j)} className="text-indigo-600 dark:text-indigo-400 font-bold text-sm hover:underline transition-all">View</button>
+                </div>
               </td>
             </tr>
           )) : (
@@ -883,7 +998,7 @@ const HowItWorks = () => (
     </div>
 )
 
-const JobDetailView = ({ job, onBack }) => (
+const JobDetailView = ({ job, onBack, onResponse, onAnalyzeMetadata }) => (
   <div className="pt-24 px-6 max-w-4xl mx-auto pb-32">
     <button onClick={onBack} className="flex items-center gap-2 text-indigo-600 dark:text-indigo-400 font-bold mb-8 hover:gap-3 transition-all">
       <ArrowRight size={20} className="rotate-180" /> Back to Dashboard
@@ -928,8 +1043,8 @@ const JobDetailView = ({ job, onBack }) => (
         <h3 className="font-bold text-slate-400 dark:text-slate-500 uppercase text-xs tracking-widest mb-6">Response Metrics</h3>
         <div className="space-y-4">
           <div className="flex justify-between items-center text-sm font-bold">
-            <span className="text-slate-600 dark:text-slate-400">Response Score</span>
-            <span className="text-emerald-500">{job.responseScore}</span>
+            <span className="text-slate-600 dark:text-slate-400">Response</span>
+            <span className="text-emerald-500">{formatResponseStatus(job)}</span>
           </div>
           <div className="flex justify-between items-center text-sm font-bold">
             <span className="text-slate-600 dark:text-slate-400">Delay Penalty</span>
@@ -940,10 +1055,40 @@ const JobDetailView = ({ job, onBack }) => (
             <span className="text-slate-900 dark:text-white">{formatTimestamp(job.lastInteractionTime)}</span>
           </div>
         </div>
+        <div className="mt-6 pt-4 border-t border-slate-100 dark:border-slate-800 flex flex-wrap gap-2">
+          {RESPONSE_ACTIONS.map(([type, label]) => (
+            <button key={type} onClick={() => onResponse(job, type)} className="px-3 py-2 rounded-lg bg-slate-100 dark:bg-slate-800 text-xs font-bold text-slate-600 dark:text-slate-300">
+              {label}
+            </button>
+          ))}
+        </div>
       </div>
     </div>
+    <EmailMetadataCheck job={job} onAnalyze={onAnalyzeMetadata} />
   </div>
 )
+
+const EmailMetadataCheck = ({ job, onAnalyze }) => {
+  const [sender, setSender] = useState('')
+  const [subject, setSubject] = useState('')
+  const [status, setStatus] = useState('')
+  const submit = async () => {
+    setStatus('Checking...')
+    const result = await onAnalyze(job, { sender, subject, timestamp: new Date().toISOString() })
+    setStatus(result?.matched ? `${formatResponseStatus({ responseStatus: result.responseType?.replace('_detected', '').replace('application_acknowledged', 'acknowledged') })}` : (result?.reason || 'No match'))
+  }
+  return (
+    <div className="glass-card dark:bg-slate-900/50 dark:border-slate-800 mt-8">
+      <h3 className="font-bold text-slate-400 dark:text-slate-500 uppercase text-xs tracking-widest mb-4">Email Metadata Check</h3>
+      <div className="grid md:grid-cols-2 gap-3">
+        <input className="bg-white dark:bg-slate-950 border border-slate-200 dark:border-slate-800 rounded-lg px-3 py-2 text-sm" placeholder="sender@company.com" value={sender} onChange={e => setSender(e.target.value)} />
+        <input className="bg-white dark:bg-slate-950 border border-slate-200 dark:border-slate-800 rounded-lg px-3 py-2 text-sm" placeholder="Subject line" value={subject} onChange={e => setSubject(e.target.value)} />
+      </div>
+      <button onClick={submit} className="mt-3 text-indigo-600 dark:text-indigo-400 text-sm font-bold hover:underline">Analyze Metadata</button>
+      {status && <div className="mt-2 text-xs font-bold text-slate-500">{status}</div>}
+    </div>
+  )
+}
 
 const VerifyEmailView = ({ email, onVerify }) => (
   <div className="pt-32 px-6 max-w-md mx-auto text-center">
@@ -1177,6 +1322,16 @@ function App() {
     if (!user) {
       return
     }
+    if (['home', 'login', 'signup'].includes(activeTab)) {
+      setActiveTab('dashboard')
+      return
+    }
+  }, [user, activeTab])
+
+  useEffect(() => {
+    if (!user) {
+      return
+    }
     const roleRoute = user.role === 'Recruiter' ? 'employer-dashboard' :
       user.role === 'Admin' ? 'admin-dashboard' : 'dashboard'
     setActiveTab(roleRoute)
@@ -1196,8 +1351,11 @@ function App() {
       axios.get(`${API_URL}/api/dashboard`, { headers }),
       axios.get(`${API_URL}/api/analytics`, { headers }),
     ])
-    setJobs(dashboardRes.data.jobs || [])
-    setAnalytics(analyticsRes.data || {})
+    const dashboardJobs = dashboardRes.data.jobs || []
+    const derivedAnalytics = buildAnalyticsFromJobs(dashboardJobs, dashboardRes.data.signalCount ?? 0, dashboardRes.data.lastUpdated || null)
+    const backendAnalytics = analyticsRes.data || {}
+    setJobs(dashboardJobs)
+    setAnalytics((backendAnalytics.totalApplications || 0) > 0 ? backendAnalytics : derivedAnalytics)
     setSignalStats({
       signalCount: dashboardRes.data.signalCount ?? analyticsRes.data.signalCount ?? 0,
       latestScore: dashboardRes.data.latestScore ?? 0,
@@ -1269,6 +1427,41 @@ function App() {
     setSelectedJob(null)
   }
 
+  const handleResponseUpdate = async (job, responseType) => {
+    if (!user?.token || !job?.jobId) return
+    setJobs(current => current.map(item => item.jobId === job.jobId ? { ...item, responseUpdating: true, responseError: false } : item))
+    try {
+      const res = await axios.post(
+        `${API_URL}/api/jobs/${encodeURIComponent(job.jobId)}/response`,
+        { responseType, source: 'manual', timestamp: new Date().toISOString() },
+        { headers: getAuthHeaders(user.token) },
+      )
+      console.debug('AESD response dropdown updated', {
+        selectedResponseType: responseType,
+        apiStatus: res.status,
+        updatedResponseStatus: res.data?.responseStatus,
+        updatedRecommendation: res.data?.recommendation,
+      })
+      setJobs(current => current.map(item => item.jobId === job.jobId ? { ...item, ...res.data, responseUpdating: false, responseError: false } : item))
+      setSelectedJob(current => current?.jobId === job.jobId ? { ...current, ...res.data } : current)
+      await loadDashboardData()
+    } catch (error) {
+      setJobs(current => current.map(item => item.jobId === job.jobId ? { ...item, responseUpdating: false, responseError: true } : item))
+    }
+  }
+
+  const handleAnalyzeMetadata = async (job, email) => {
+    if (!user?.token || !job?.jobId) return null
+    const res = await axios.post(
+      `${API_URL}/api/email/analyze-metadata`,
+      { jobId: job.jobId, company: job.companyName, emails: [email] },
+      { headers: getAuthHeaders(user.token) },
+    )
+    await loadDashboardData()
+    setSelectedJob(current => current?.jobId === job.jobId ? { ...current, responseStatus: res.data.responseType?.replace('_detected', '').replace('application_acknowledged', 'acknowledged') } : current)
+    return res.data
+  }
+
   return (
     <div className="min-h-screen bg-slate-50 dark:bg-slate-950 text-slate-900 dark:text-white font-sans selection:bg-indigo-100 dark:selection:bg-indigo-900 selection:text-indigo-900 dark:selection:text-indigo-100 transition-colors duration-300">
       <Nav user={user} activeTab={activeTab} setActiveTab={setActiveTab} onSignOut={handleSignOut} theme={theme} toggleTheme={toggleTheme} />
@@ -1295,6 +1488,7 @@ function App() {
             onSelectJob={setSelectedJob}
             onNavigateToAnalytics={() => setActiveTab('analytics')}
             onRefresh={loadDashboardData}
+            onResponse={handleResponseUpdate}
             lastUpdated={lastUpdated}
             signalCount={signalStats.signalCount}
             latestScore={signalStats.latestScore}
@@ -1306,7 +1500,7 @@ function App() {
         {activeTab === 'admin-dashboard' && <AdminDashboard user={user} />}
         {activeTab === 'verify-email' && <VerifyEmailView email={user?.email} onVerify={() => handleAuth({...user, isEmailVerified: true})} />}
         {activeTab === 'onboarding' && <OnboardingView onComplete={() => handleAuth({...user, isOnboarded: true})} />}
-        {activeTab === 'dashboard' && selectedJob && <JobDetailView job={selectedJob} onBack={() => setSelectedJob(null)} />}
+        {activeTab === 'dashboard' && selectedJob && <JobDetailView job={selectedJob} onBack={() => setSelectedJob(null)} onResponse={handleResponseUpdate} onAnalyzeMetadata={handleAnalyzeMetadata} />}
         {activeTab === 'integrations' && <IntegrationsView user={user} isEmailSynced={isEmailSynced} setIsEmailSynced={setIsEmailSynced} />}
         {activeTab === 'how-it-works' && <HowItWorks />}
         {activeTab === 'privacy' && <PrivacyPage />}
@@ -1331,7 +1525,7 @@ function App() {
       <footer className="py-20 border-t border-slate-200 dark:border-slate-800 mt-20 bg-white dark:bg-slate-900">
         <div className="max-w-7xl mx-auto px-6 grid md:grid-cols-4 gap-12 text-slate-900 dark:text-white">
            <div className="col-span-2">
-              <div className="flex items-center gap-2 mb-6 cursor-pointer" onClick={() => setActiveTab('home')}>
+              <div className="flex items-center gap-2 mb-6 cursor-pointer" onClick={() => setActiveTab(user ? 'dashboard' : 'home')}>
                 <div className="w-6 h-6 bg-indigo-600 rounded flex items-center justify-center text-white font-bold text-xs italic">JZ</div>
                 <span className="font-extrabold text-lg">JobZoid</span>
               </div>
@@ -1340,9 +1534,11 @@ function App() {
             <div>
               <h4 className="font-bold mb-4 uppercase text-xs tracking-widest text-slate-400">Product</h4>
               <ul className="space-y-2 text-sm font-bold text-slate-600 dark:text-slate-300">
-                <li onClick={() => setActiveTab('how-it-works')} className="hover:text-indigo-600 dark:hover:text-indigo-400 cursor-pointer transition-colors">Extension</li>
-                <li onClick={() => setActiveTab('leaderboard')} className="hover:text-indigo-600 dark:hover:text-indigo-400 cursor-pointer transition-colors">Fairness Rankings</li>
-                <li onClick={() => setActiveTab('integrations')} className="hover:text-indigo-600 dark:hover:text-indigo-400 cursor-pointer transition-colors">Integrations</li>
+                {user && <li onClick={() => setActiveTab('dashboard')} className="hover:text-indigo-600 dark:hover:text-indigo-400 cursor-pointer transition-colors">Dashboard</li>}
+                {user && <li onClick={() => setActiveTab('analytics')} className="hover:text-indigo-600 dark:hover:text-indigo-400 cursor-pointer transition-colors">Analytics</li>}
+                <li onClick={() => setActiveTab('how-it-works')} className="hover:text-indigo-600 dark:hover:text-indigo-400 cursor-pointer transition-colors">How It Works</li>
+                {!user && <li onClick={() => setActiveTab('leaderboard')} className="hover:text-indigo-600 dark:hover:text-indigo-400 cursor-pointer transition-colors">Fairness Rankings</li>}
+                {user && <li onClick={() => setActiveTab('integrations')} className="hover:text-indigo-600 dark:hover:text-indigo-400 cursor-pointer transition-colors">Integrations</li>}
                 <li className="hover:text-amber-600 dark:hover:text-amber-400 cursor-pointer flex items-center gap-2 transition-colors">Security Protocol <Shield size={14} /></li>
               </ul>
             </div>
@@ -1350,6 +1546,7 @@ function App() {
               <h4 className="font-bold mb-4 uppercase text-xs tracking-widest text-slate-400">Trust</h4>
               <ul className="space-y-2 text-sm font-bold text-slate-600 dark:text-slate-300">
                 <li onClick={() => setActiveTab('privacy')} className="hover:text-indigo-600 dark:hover:text-indigo-400 cursor-pointer transition-colors">Privacy First Policy</li>
+                <li onClick={() => setActiveTab('about')} className="hover:text-indigo-600 dark:hover:text-indigo-400 cursor-pointer transition-colors">About</li>
                 <li className="hover:text-indigo-600 dark:hover:text-indigo-400 cursor-pointer transition-colors">Terms of Service</li>
               </ul>
            </div>

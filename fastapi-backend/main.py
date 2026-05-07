@@ -7,6 +7,9 @@ import time
 import json
 from pathlib import Path
 import sqlite3
+from datetime import datetime, timezone
+from urllib.parse import unquote
+import hashlib
 
 from scoring import calculate_energy_sink_score
 from auth import create_access_token, get_password_hash, verify_password, decode_access_token
@@ -38,11 +41,7 @@ app.add_middleware(
 DB_PATH = Path(__file__).with_name("aesd_demo.db").resolve()
 print(f"Active AESD DB path: {DB_PATH}")
 
-jobs_db = [
-    {"id": 1, "title": "Senior Frontend Developer", "company_name": "ABC Corp", "score": 72, "status": "Ghosted"},
-    {"id": 2, "title": "Product Designer", "company_name": "Meta", "score": 18, "status": "Active"},
-    {"id": 3, "title": "Staff Engineer", "company_name": "Stripe", "score": 42, "status": "Slow"},
-]
+jobs_db = []
 signals_db = []
 tracked_jobs_db = {}
 SUPPORTED_SIGNAL_TYPES = {
@@ -52,6 +51,7 @@ SUPPORTED_SIGNAL_TYPES = {
     "apply_click",
     "easy_apply_click",
     "application_submitted",
+    "application_acknowledged",
     "external_apply_redirect",
     "form_interaction",
     "resume_upload",
@@ -61,6 +61,7 @@ SUPPORTED_SIGNAL_TYPES = {
     "employer_response_detected",
     "interview_detected",
     "rejection_detected",
+    "offer_detected",
     "assessment_detected",
     "no_response_after_delay",
     "status_change_detected",
@@ -73,15 +74,57 @@ MEANINGFUL_DIRECT_SIGNALS = {
     "external_apply_redirect",
 }
 RESPONSE_SIGNALS = {
+    "application_acknowledged",
     "employer_response_detected",
     "interview_detected",
     "rejection_detected",
+    "offer_detected",
     "status_change_detected",
     "email_response_detected",
+}
+RESPONSE_LABELS = {
+    "application_acknowledged": ("acknowledged", 20),
+    "employer_response_detected": ("acknowledged", 20),
+    "status_change_detected": ("acknowledged", 20),
+    "email_response_detected": ("acknowledged", 20),
+    "interview_detected": ("interview", 70),
+    "offer_detected": ("offer", 90),
+    "rejection_detected": ("rejected", 40),
+    "no_response_after_delay": ("no_response", 0),
+}
+RESPONSE_PRIORITY = {
+    "pending": 0,
+    "no_response_after_delay": 1,
+    "application_acknowledged": 2,
+    "employer_response_detected": 2,
+    "status_change_detected": 2,
+    "email_response_detected": 2,
+    "rejection_detected": 3,
+    "interview_detected": 4,
+    "offer_detected": 5,
 }
 
 def clamp(value, low=0, high=100):
     return max(low, min(high, value))
+
+def iso_from_epoch(value):
+    if not value:
+        return None
+    return datetime.fromtimestamp(int(value), tz=timezone.utc).isoformat()
+
+def normalize_timestamp(value):
+    if not value:
+        return int(time.time() * 1000)
+    if isinstance(value, (int, float)):
+        return int(value)
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        try:
+            parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+            return int(parsed.timestamp() * 1000)
+        except ValueError:
+            return int(time.time() * 1000)
 
 def calculate_signal_score(signal_rows):
     signal_types = [normalize_signal_type(row["signal_type"] or row["event_type"]) for row in signal_rows]
@@ -96,6 +139,13 @@ def calculate_signal_score(signal_rows):
     page_visits = signal_types.count("page_visit")
     no_response_events = signal_types.count("no_response_after_delay")
     response_events = sum(1 for value in signal_types if value in RESPONSE_SIGNALS)
+    response_status = "pending"
+    response_source = None
+    last_response_at = None
+    response_score = 0
+    active_response_type = None
+    active_response_metadata = {}
+    response_candidates = []
     time_spent = sum(int(row["timestamp"] and 0) for row in [])
     scroll_depth = 0
     for row in signal_rows:
@@ -107,6 +157,43 @@ def calculate_signal_score(signal_rows):
             time_spent += int(metadata.get("timeSpentSeconds") or metadata.get("timeSpent") or 0)
         if normalize_signal_type(row["signal_type"] or row["event_type"]) == "scroll_depth":
             scroll_depth = max(scroll_depth, int(metadata.get("scrollDepth") or 0))
+        row_type = normalize_signal_type(row["signal_type"] or row["event_type"])
+        if row_type in RESPONSE_LABELS:
+            response_candidates.append({
+                "id": row["id"],
+                "type": row_type,
+                "source": metadata.get("source") or "passive",
+                "created_at": row["created_at"],
+                "metadata": metadata,
+            })
+
+    manual_responses = [item for item in response_candidates if item["source"] == "manual"]
+    if manual_responses:
+        active = max(manual_responses, key=lambda item: (item["created_at"] or 0, item["id"] or 0))
+    elif response_candidates:
+        active = max(response_candidates, key=lambda item: (
+            RESPONSE_PRIORITY.get(item["type"], 0),
+            item["created_at"] or 0,
+            item["id"] or 0,
+        ))
+    else:
+        active = None
+
+    print("AESD response resolution:", {
+        "allResponseSignals": [
+            {"id": item["id"], "type": item["type"], "source": item["source"], "created_at": item["created_at"]}
+            for item in response_candidates
+        ],
+        "latestManualResponse": active["type"] if active and active["source"] == "manual" else None,
+        "chosenActiveResponse": active["type"] if active else None,
+    })
+
+    if active:
+        active_response_type = active["type"]
+        active_response_metadata = active["metadata"]
+        response_status, response_score = RESPONSE_LABELS[active_response_type]
+        response_source = active["source"]
+        last_response_at = active["created_at"]
 
     meaningful_effort = bool(
         apply_clicks or easy_apply_clicks or application_submitted or external_redirects or
@@ -125,8 +212,8 @@ def calculate_signal_score(signal_rows):
         cover_letters * 30 +
         repeated_visits * 5
     )
-    response_score = clamp(response_events * 25)
-    delay_penalty = 35 if no_response_events else 0
+    response_score = clamp(response_score)
+    delay_penalty = 35 if active_response_type == "no_response_after_delay" else 0
     authenticity_penalty = 0
 
     if not meaningful_effort:
@@ -143,6 +230,11 @@ def calculate_signal_score(signal_rows):
             "energySinkScore": None,
             "scoreStatus": "not_enough_effort_data",
             "recommendation": "Tracking",
+            "responseStatus": response_status,
+            "responseSource": response_source,
+            "lastResponseAt": iso_from_epoch(last_response_at),
+            "timeToResponseHours": None,
+            "activeResponseType": active_response_type,
         }
 
     energy_sink_score = round(clamp(
@@ -175,6 +267,11 @@ def calculate_signal_score(signal_rows):
         "energySinkScore": energy_sink_score,
         "scoreStatus": score_status,
         "recommendation": recommendation,
+        "responseStatus": response_status,
+        "responseSource": response_source,
+        "lastResponseAt": iso_from_epoch(last_response_at),
+        "timeToResponseHours": None,
+        "activeResponseType": active_response_type,
     }
 
 def get_current_user_email(request: Request) -> str:
@@ -188,7 +285,8 @@ def get_current_user_email(request: Request) -> str:
     return "demo@example.com"
 
 def get_user_id(email: str) -> int:
-    return abs(hash(email.strip().lower())) % 100000000
+    digest = hashlib.sha256(email.strip().lower().encode("utf-8")).hexdigest()
+    return int(digest[:12], 16) % 100000000
 
 def get_db():
     conn = sqlite3.connect(DB_PATH)
@@ -338,6 +436,21 @@ class JobAnalysisRequest(BaseModel):
 class MailAnalysisRequest(BaseModel):
     headers: List[dict]
 
+class JobResponseRequest(BaseModel):
+    responseType: str
+    source: str = "manual"
+    timestamp: Optional[str] = None
+
+class EmailMetadataItem(BaseModel):
+    sender: str
+    subject: str
+    timestamp: Optional[str] = None
+
+class EmailMetadataRequest(BaseModel):
+    jobId: str
+    company: Optional[str] = None
+    emails: List[EmailMetadataItem]
+
 # Endpoints
 @app.get("/")
 async def root():
@@ -452,72 +565,13 @@ async def get_dashboard(request: Request):
   user_email = get_current_user_email(request)
   user_id = get_user_id(user_email)
   print("AESD dashboard requested:", {"user_id": user_id, "email": user_email})
-  enhanced_jobs = []
   with get_db() as conn:
-    rows = conn.execute("""
-      SELECT * FROM tracked_jobs
-      WHERE user_id = ?
-      ORDER BY COALESCE(last_interaction_time, 0) DESC
-    """, (user_id,)).fetchall()
-    signal_count = conn.execute("SELECT COUNT(*) AS count FROM signals WHERE user_id = ?", (user_id,)).fetchone()["count"]
-  for tracked in rows:
-    job_id = tracked["job_id"]
-    with get_db() as conn:
-      score = score_job_from_db(conn, user_id, job_id)
-    print("AESD scoring debug:", {
-      "jobId": job_id,
-      "jobTitle": tracked["job_title"],
-      "company": tracked["company_name"],
-      **score,
-    })
-    enhanced_jobs.append({
-      "id": job_id,
-      "jobId": job_id,
-      "title": tracked["job_title"],
-      "company_name": tracked["company_name"],
-      "jobTitle": tracked["job_title"],
-      "companyName": tracked["company_name"],
-      "ai_score": 0,
-      "energySinkScore": score["energySinkScore"],
-      "scoreStatus": score["scoreStatus"],
-      "effortScore": score["effortScore"],
-      "responseScore": score["responseScore"],
-      "recommendation": score["recommendation"],
-      "totalTimeSpent": score["timeSpent"],
-      "maxScrollDepth": score["scrollDepth"],
-      "applyClicks": score["applyClicks"] + score["easyApplyClicks"] + score["applicationSubmitted"],
-      "delayPenalty": 0,
-      "lastInteractionTime": tracked["last_interaction_time"],
-    })
-  for j in jobs_db:
-    j_copy = j.copy()
-    ai_score = predict_authenticity(f"{j['title']} at {j['company_name']}")
-    j_copy["ai_score"] = ai_score
-    j_copy["jobId"] = str(j["id"])
-    j_copy["jobTitle"] = j["title"]
-    j_copy["companyName"] = j["company_name"]
-    j_copy["energySinkScore"] = j.get("score", 0)
-    j_copy["scoreStatus"] = "scored" if j.get("score") is not None else "not_enough_effort_data"
-    j_copy["effortScore"] = 0
-    j_copy["responseScore"] = 0
-    j_copy["recommendation"] = "Tracking"
-    j_copy["totalTimeSpent"] = 0
-    j_copy["maxScrollDepth"] = 0
-    j_copy["applyClicks"] = 0
-    j_copy["delayPenalty"] = 0
-    j_copy["lastInteractionTime"] = None
-    if j_copy["scoreStatus"] == "scored":
-      if j_copy["energySinkScore"] >= 70:
-        j_copy["recommendation"] = "Avoid"
-      elif j_copy["energySinkScore"] >= 40:
-        j_copy["recommendation"] = "Apply cautiously"
-      else:
-        j_copy["recommendation"] = "Apply confidently"
-    enhanced_jobs.append(j_copy)
+    signal_count = conn.execute("SELECT COUNT(*) AS count FROM signals WHERE user_email = ?", (user_email,)).fetchone()["count"]
+  enhanced_jobs = build_dashboard_jobs(user_email)
   return {
     "jobs": enhanced_jobs,
     "signalCount": signal_count,
-    "latestScore": max([(job.get("energySinkScore") or 0) for job in enhanced_jobs] + [j.get("score", 0) for j in jobs_db], default=0),
+    "latestScore": max([(job.get("energySinkScore") or 0) for job in enhanced_jobs], default=0),
     "lastUpdated": int(time.time())
   }
 
@@ -561,6 +615,12 @@ def normalize_signal_type(value):
         "application": "application_submitted",
         "job_page_visit": "page_visit",
         "response": "employer_response_detected",
+        "acknowledged": "application_acknowledged",
+        "interview": "interview_detected",
+        "rejected": "rejection_detected",
+        "rejection": "rejection_detected",
+        "offer": "offer_detected",
+        "no_response": "no_response_after_delay",
     }.get(value, value)
 
 def normalize_signal_payload(signal):
@@ -579,7 +639,7 @@ def normalize_signal_payload(signal):
     payload["jobUrl"] = payload.get("jobUrl") or payload.get("url") or metadata.get("jobUrl") or ""
     payload["platform"] = payload.get("platform") or metadata.get("platform") or ""
     payload["pageType"] = payload.get("pageType") or metadata.get("pageType") or ""
-    payload["timestamp"] = payload.get("timestamp") or int(time.time() * 1000)
+    payload["timestamp"] = normalize_timestamp(payload.get("timestamp"))
     payload["metadata"] = {
         **metadata,
         "timeSpentSeconds": payload.get("timeSpentSeconds") or payload.get("timeSpent") or metadata.get("timeSpentSeconds"),
@@ -602,12 +662,108 @@ def validate_signal_payload(payload):
         return "Invalid job context: generic title or company"
     return None
 
-def score_job_from_db(conn, user_id, job_id):
+def build_response_payload(job, response_type, source, timestamp=None, metadata=None):
+    return {
+        "signalType": normalize_signal_type(response_type),
+        "eventType": normalize_signal_type(response_type),
+        "jobId": job["job_id"],
+        "jobTitle": job["job_title"],
+        "companyName": job["company_name"],
+        "company": job["company_name"],
+        "jobUrl": job["job_url"],
+        "platform": job["platform"],
+        "pageType": job["page_type"],
+        "timestamp": timestamp or int(time.time() * 1000),
+        "metadata": {
+            "source": source,
+            **(metadata or {}),
+        },
+    }
+
+def score_job_from_db(conn, user_email, job_id):
     rows = conn.execute(
-        "SELECT * FROM signals WHERE user_id = ? AND job_id = ?",
-        (user_id, job_id),
+        "SELECT * FROM signals WHERE user_email = ? AND job_id = ? ORDER BY id ASC",
+        (user_email, job_id),
     ).fetchall()
     return calculate_signal_score(rows)
+
+def build_dashboard_jobs(user_email):
+    enhanced_jobs = []
+    with get_db() as conn:
+        rows = conn.execute("""
+          SELECT * FROM tracked_jobs
+          WHERE user_email = ?
+          ORDER BY COALESCE(last_interaction_time, 0) DESC
+        """, (user_email,)).fetchall()
+    seen_job_ids = set()
+    for tracked in rows:
+        job_id = tracked["job_id"]
+        if job_id in seen_job_ids:
+            continue
+        seen_job_ids.add(job_id)
+        with get_db() as conn:
+            score = score_job_from_db(conn, user_email, job_id)
+        enhanced_jobs.append({
+          "id": job_id,
+          "jobId": job_id,
+          "title": tracked["job_title"],
+          "company_name": tracked["company_name"],
+          "jobTitle": tracked["job_title"],
+          "companyName": tracked["company_name"],
+          "ai_score": 0,
+          "energySinkScore": score["energySinkScore"],
+          "scoreStatus": score["scoreStatus"],
+          "effortScore": score["effortScore"],
+          "responseScore": score["responseScore"],
+          "recommendation": score["recommendation"],
+          "responseStatus": score["responseStatus"],
+          "responseSource": score["responseSource"],
+          "lastResponseAt": score["lastResponseAt"],
+          "timeToResponseHours": score["timeToResponseHours"],
+          "totalTimeSpent": score["timeSpent"],
+          "maxScrollDepth": score["scrollDepth"],
+          "applyClicks": score["applyClicks"] + score["easyApplyClicks"] + score["applicationSubmitted"],
+          "delayPenalty": 0,
+          "lastInteractionTime": tracked["last_interaction_time"],
+        })
+    return enhanced_jobs
+
+def calculate_analytics_from_jobs(jobs, signal_count=0):
+    valid_jobs = [job for job in jobs if str(job.get("jobId", "")).startswith("linkedin:") or job.get("effortScore", 0) > 0]
+    numeric_jobs = [job for job in valid_jobs if isinstance(job.get("energySinkScore"), (int, float))]
+    responded = [job for job in valid_jobs if (job.get("responseStatus") or "pending") not in {"pending", ""}]
+    total = len(valid_jobs)
+    average_score = round(sum(job["energySinkScore"] for job in numeric_jobs) / len(numeric_jobs), 1) if numeric_jobs else 0
+    response_rate = round((len(responded) / total) * 100) if total else 0
+    company_groups = {}
+    for job in numeric_jobs:
+        company = job.get("companyName") or job.get("company") or "Unknown"
+        company_groups.setdefault(company, []).append(job)
+    ranked = []
+    for company, rows in company_groups.items():
+        avg = round(sum(row["energySinkScore"] for row in rows) / len(rows), 1)
+        ranked.append({
+            "companyName": company,
+            "jobTitle": rows[0].get("jobTitle"),
+            "energySinkScore": avg,
+            "applicationCount": len(rows),
+        })
+    ranked.sort(key=lambda item: item["energySinkScore"], reverse=True)
+    avg_effort = round(sum(job.get("effortScore", 0) for job in valid_jobs) / total, 1) if total else 0
+    return {
+        "totalApplications": total,
+        "averageResponseRate": response_rate,
+        "averageEnergyScore": average_score,
+        "topRiskyCompanies": ranked[:5],
+        "bestCompanies": list(reversed(ranked[-5:])),
+        "signalCount": signal_count,
+        "lastUpdated": int(time.time()),
+        "summary": {
+            "averageEffort": avg_effort,
+            "responseCount": len(responded),
+            "pendingResponseCount": max(total - len(responded), 0),
+        },
+    }
 
 def store_signal(user_id, user_email, payload):
     with get_db() as conn:
@@ -627,7 +783,7 @@ def store_signal(user_id, user_email, payload):
             payload["pageType"],
             payload["signalType"],
             payload["signalType"],
-            int(payload.get("timestamp") or int(time.time() * 1000)),
+            normalize_timestamp(payload.get("timestamp")),
             json.dumps(payload.get("metadata") or {}),
             int(time.time()),
         ))
@@ -638,13 +794,13 @@ def upsert_tracked_job(user_id, user_email, payload):
     now = int(time.time())
     with get_db() as conn:
         signal_rows = conn.execute(
-            "SELECT * FROM signals WHERE job_id = ? AND user_id = ?",
-            (job_id, user_id),
+            "SELECT * FROM signals WHERE job_id = ? AND user_email = ? ORDER BY id ASC",
+            (job_id, user_email),
         ).fetchall()
         score = calculate_signal_score(signal_rows)
         existing = conn.execute(
-            "SELECT * FROM tracked_jobs WHERE job_id = ? AND user_id = ?",
-            (job_id, user_id),
+            "SELECT * FROM tracked_jobs WHERE job_id = ? AND user_email = ?",
+            (job_id, user_email),
         ).fetchone()
         if existing:
             conn.execute("""
@@ -663,7 +819,7 @@ def upsert_tracked_job(user_id, user_email, payload):
                     recommendation = ?,
                     energy_sink_score = ?,
                     last_interaction_time = ?
-                WHERE job_id = ? AND user_id = ?
+                WHERE job_id = ? AND user_email = ?
             """, (
                 payload["jobTitle"] or existing["job_title"],
                 payload["companyName"] or existing["company_name"],
@@ -680,7 +836,7 @@ def upsert_tracked_job(user_id, user_email, payload):
                 score["energySinkScore"],
                 now,
                 job_id,
-                user_id,
+                user_email,
             ))
         else:
             conn.execute("""
@@ -722,21 +878,25 @@ async def get_score_by_query(request: Request, jobId: str, jobTitle: Optional[st
     user_id = get_user_id(user_email)
     with get_db() as conn:
         tracked = conn.execute(
-            "SELECT * FROM tracked_jobs WHERE job_id = ? AND user_id = ?",
-            (jobId, user_id),
+            "SELECT * FROM tracked_jobs WHERE job_id = ? AND user_email = ?",
+            (jobId, user_email),
         ).fetchone()
-        score = score_job_from_db(conn, user_id, jobId) if tracked else None
+        score = score_job_from_db(conn, user_email, jobId) if tracked else None
     if not tracked:
         return {
             "jobId": jobId,
             "jobTitle": jobTitle,
             "companyName": companyName,
             "energySinkScore": None,
-            "scoreStatus": "not_enough_effort_data",
-            "recommendation": "Tracking",
-            "effortScore": 0,
-            "responseScore": 0,
-        }
+        "scoreStatus": "not_enough_effort_data",
+        "recommendation": "Tracking",
+        "effortScore": 0,
+        "responseScore": 0,
+        "responseStatus": "pending",
+        "responseSource": None,
+        "lastResponseAt": None,
+        "timeToResponseHours": None,
+    }
     print("AESD scoring debug:", {
         "jobId": jobId,
         "jobTitle": tracked["job_title"],
@@ -752,11 +912,102 @@ async def get_score_by_query(request: Request, jobId: str, jobTitle: Optional[st
         "effortScore": score["effortScore"],
         "responseScore": score["responseScore"],
         "recommendation": score["recommendation"],
+        "responseStatus": score["responseStatus"],
+        "responseSource": score["responseSource"],
+        "lastResponseAt": score["lastResponseAt"],
+        "timeToResponseHours": score["timeToResponseHours"],
         "totalTimeSpent": score["timeSpent"],
         "maxScrollDepth": score["scrollDepth"],
         "applyClicks": score["applyClicks"] + score["easyApplyClicks"] + score["applicationSubmitted"],
         "lastInteractionTime": tracked["last_interaction_time"],
     }
+
+@app.post("/api/jobs/{job_id:path}/response")
+async def update_job_response(job_id: str, req: JobResponseRequest, request: Request):
+    job_id = unquote(job_id)
+    user_email = get_current_user_email(request)
+    user_id = get_user_id(user_email)
+    response_type = normalize_signal_type(req.responseType)
+    if response_type not in RESPONSE_LABELS:
+        raise HTTPException(status_code=422, detail=f"Invalid responseType: {req.responseType}")
+    with get_db() as conn:
+        job = conn.execute(
+            "SELECT * FROM tracked_jobs WHERE job_id = ? AND user_email = ?",
+            (job_id, user_email),
+        ).fetchone()
+    if not job:
+        raise HTTPException(status_code=404, detail="Tracked job not found for current user")
+    payload = build_response_payload(job, response_type, req.source, req.timestamp, {"responseType": response_type})
+    validation_error = validate_signal_payload(payload)
+    if validation_error:
+        raise HTTPException(status_code=422, detail=validation_error)
+    signal_id = store_signal(user_id, user_email, payload)
+    upsert_tracked_job(user_id, user_email, payload)
+    with get_db() as conn:
+        score = score_job_from_db(conn, user_email, job_id)
+    print("AESD response stored:", {
+        "user_id": user_id,
+        "email": user_email,
+        "jobId": job_id,
+        "responseType": response_type,
+        "source": req.source,
+        "signal_id": signal_id,
+    })
+    return {
+        "status": "updated",
+        "jobId": job_id,
+        "signalId": signal_id,
+        **score,
+    }
+
+@app.post("/api/email/analyze-metadata")
+async def analyze_email_metadata(req: EmailMetadataRequest, request: Request):
+    user_email = get_current_user_email(request)
+    user_id = get_user_id(user_email)
+    with get_db() as conn:
+        job = conn.execute(
+            "SELECT * FROM tracked_jobs WHERE job_id = ? AND user_email = ?",
+            (req.jobId, user_email),
+        ).fetchone()
+    if not job:
+        raise HTTPException(status_code=404, detail="Tracked job not found for current user")
+
+    patterns = [
+        ("interview_detected", ["interview", "schedule", "calendly", "hirevue", "meeting"], 0.8, "Subject matched interview pattern"),
+        ("rejection_detected", ["rejection", "not selected", "unfortunately", "regret", "not moving forward"], 0.75, "Subject matched rejection pattern"),
+        ("offer_detected", ["offer", "selected", "congratulations"], 0.85, "Subject matched offer pattern"),
+        ("application_acknowledged", ["received", "application received", "thank you for applying", "thanks for applying"], 0.7, "Subject matched acknowledgment pattern"),
+    ]
+    company_key = "".join(ch for ch in (req.company or job["company_name"]).lower() if ch.isalnum())
+    for email in req.emails:
+        subject = (email.subject or "").lower()
+        sender = (email.sender or "").lower()
+        sender_key = "".join(ch for ch in sender.split("@")[-1] if ch.isalnum())
+        for response_type, terms, confidence, reason in patterns:
+            if any(term in subject for term in terms):
+                if company_key and company_key not in sender_key and company_key not in "".join(ch for ch in subject if ch.isalnum()):
+                    confidence = min(confidence, 0.65)
+                payload = build_response_payload(job, response_type, "email_metadata", email.timestamp, {
+                    "sender": email.sender,
+                    "subject": email.subject,
+                    "emailTimestamp": email.timestamp,
+                })
+                signal_id = store_signal(user_id, user_email, payload)
+                upsert_tracked_job(user_id, user_email, payload)
+                print("AESD email metadata response stored:", {
+                    "user_id": user_id,
+                    "jobId": req.jobId,
+                    "responseType": response_type,
+                    "signal_id": signal_id,
+                })
+                return {
+                    "matched": True,
+                    "responseType": response_type,
+                    "source": "email_metadata",
+                    "confidence": confidence,
+                    "reason": reason,
+                }
+    return {"matched": False, "reason": "No relevant metadata pattern detected"}
 
 @app.get("/api/debug/signals/recent")
 async def recent_signals(request: Request):
@@ -766,10 +1017,10 @@ async def recent_signals(request: Request):
         rows = conn.execute("""
             SELECT job_id, job_title, company_name, signal_type, created_at
             FROM signals
-            WHERE user_id = ?
+            WHERE user_email = ?
             ORDER BY id DESC
             LIMIT 10
-        """, (user_id,)).fetchall()
+        """, (user_email,)).fetchall()
     return {
         "dbPath": str(DB_PATH),
         "user_id": user_id,
@@ -794,16 +1045,20 @@ async def get_score(job_id: int):
     }
 
 @app.get("/api/analytics")
-async def get_analytics():
-    return {
-        "totalApplications": 0,
-        "averageResponseRate": 0,
-        "averageEnergyScore": 0,
-        "topRiskyCompanies": [],
-        "bestCompanies": [],
-        "signalCount": 0,
-        "lastUpdated": None
-    }
+async def get_analytics(request: Request):
+    user_email = get_current_user_email(request)
+    user_id = get_user_id(user_email)
+    jobs = build_dashboard_jobs(user_email)
+    with get_db() as conn:
+        signal_count = conn.execute("SELECT COUNT(*) AS count FROM signals WHERE user_email = ?", (user_email,)).fetchone()["count"]
+    analytics = calculate_analytics_from_jobs(jobs, signal_count)
+    print("AESD analytics requested:", {
+        "user_id": user_id,
+        "email": user_email,
+        "jobs": len(jobs),
+        "totalApplications": analytics["totalApplications"],
+    })
+    return analytics
 
 @app.post("/api/mail/analyze")
 async def analyze_mail(req: MailAnalysisRequest):

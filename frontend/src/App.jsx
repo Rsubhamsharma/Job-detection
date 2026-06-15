@@ -83,6 +83,9 @@ const formatTimestamp = (value) => {
 }
 
 const formatScore = (job) => {
+  if (job?.scoreStatus === 'community' || job?.scoreStatus === 'community_seed') {
+    return Math.round(job.energySinkScore ?? 0)
+  }
   if (job?.scoreStatus === 'not_enough_effort_data' || job?.scoreStatus === 'not_enough_data') {
     return 'Not enough effort data'
   }
@@ -93,6 +96,9 @@ const formatScore = (job) => {
 }
 
 const formatEffortResponse = (job) => {
+  if (job?.isCommunityJob) {
+    return `${job.communityReports || 0} community reports`
+  }
   const effort = Math.round(job?.effortScore ?? 0)
   const response = Math.round(job?.responseScore ?? 0)
   if (job?.scoreStatus !== 'scored' && effort === 0) {
@@ -113,10 +119,14 @@ const formatResponseStatus = (job) => ({
   offer_detected: 'Offer detected',
   no_response: 'No response',
   no_response_after_delay: 'No response',
+  community_reported: 'Community reported',
   pending: 'Response pending',
 }[job?.responseStatus || 'pending'] || 'Response pending')
 
 const formatRecommendation = (job) => {
+  if (job?.scoreStatus === 'community' || job?.scoreStatus === 'community_seed') {
+    return job.recommendation || 'Apply cautiously'
+  }
   const scoreStatus = job?.scoreStatus || 'not_enough_effort_data'
   const energySinkScore = job?.energySinkScore
   
@@ -140,6 +150,8 @@ const formatRecommendation = (job) => {
 }
 
 const getRecommendationClass = (job) => {
+  if (job?.isCommunityJob && job.recommendation === 'Avoid') return 'bg-rose-100 text-rose-600'
+  if (job?.isCommunityJob) return 'bg-amber-100 text-amber-600'
   if (job?.scoreStatus === 'tracking_response_pending' || job?.scoreStatus === 'response_pending') return 'bg-amber-100 text-amber-600'
   if (job?.scoreStatus !== 'scored') return 'bg-slate-100 text-slate-600'
   if (job.recommendation === 'Avoid') return 'bg-rose-100 text-rose-600'
@@ -401,7 +413,7 @@ const PersonalAnalytics = ({ analytics, lastUpdated }) => {
     <div className="pt-24 px-6 max-w-7xl mx-auto pb-20">
       <div className="mb-12">
         <h2 className="text-3xl font-black text-slate-900 dark:text-white">Your Analytics</h2>
-        <p className="text-slate-600 dark:text-slate-400 font-medium tracking-tight">Live Data from Extension</p>
+        <p className="text-slate-600 dark:text-slate-400 font-medium tracking-tight">Your tracked jobs plus community ghost-job signals</p>
       </div>
 
       <div className="grid grid-cols-2 md:grid-cols-4 gap-6 mb-12">
@@ -546,8 +558,18 @@ const Dashboard = ({ jobs, onSelectJob, onNavigateToAnalytics, onRefresh, onResp
         <tbody className="divide-y divide-slate-100 dark:divide-slate-800">
           {jobs.length ? jobs.map((j) => (
             <tr key={j.jobId} className="hover:bg-slate-50 dark:hover:bg-slate-800/50 transition-colors group">
-              <td className="px-8 py-6 font-bold text-slate-900 dark:text-white">{j.jobTitle}</td>
-              <td className="px-8 py-6 font-bold text-slate-900 dark:text-white">{j.companyName}</td>
+              <td className="px-8 py-6">
+                <div className="font-bold text-slate-900 dark:text-white">{j.jobTitle}</div>
+                {j.isCommunityJob && (
+                  <div className="mt-2 inline-flex items-center rounded bg-amber-50 dark:bg-amber-900/20 px-2 py-1 text-[10px] font-black uppercase tracking-widest text-amber-700 dark:text-amber-300">
+                    Community signal
+                  </div>
+                )}
+              </td>
+              <td className="px-8 py-6">
+                <div className="font-bold text-slate-900 dark:text-white">{j.companyName}</div>
+                {j.isCommunityJob && <div className="mt-1 text-xs font-bold text-slate-400">{j.reportSummary}</div>}
+              </td>
               <td className="px-8 py-6">
                 <div className="flex items-center gap-2">
                    <div className={`w-2 h-2 rounded-full ${getScoreDotClass(j)}`} />
@@ -562,7 +584,7 @@ const Dashboard = ({ jobs, onSelectJob, onNavigateToAnalytics, onRefresh, onResp
               </td>
               <td className="px-8 py-6 text-right">
                 <div className="flex items-center justify-end gap-3">
-                  <ResponseDropdown job={j} onResponse={onResponse} loading={j.responseUpdating} error={j.responseError} />
+                  {!j.isCommunityJob && <ResponseDropdown job={j} onResponse={onResponse} loading={j.responseUpdating} error={j.responseError} />}
                   <button onClick={() => onSelectJob(j)} className="text-indigo-600 dark:text-indigo-400 font-bold text-sm hover:underline transition-all">View</button>
                 </div>
               </td>
@@ -1013,7 +1035,7 @@ const JobDetailView = ({ job, onBack, onResponse, onAnalyzeMetadata }) => (
           <h2 className="text-3xl font-black text-slate-900 dark:text-white mb-2">{job.companyName}</h2>
           <p className="text-xl text-slate-600 dark:text-slate-400 font-bold">{job.jobTitle}</p>
         </div>
-        <EnergySinkGauge score={job.scoreStatus === 'scored' ? Math.round(job.energySinkScore) : 0} />
+        <EnergySinkGauge score={(job.scoreStatus === 'scored' || job.isCommunityJob) ? Math.round(job.energySinkScore || 0) : 0} />
       </div>
     </div>
 
@@ -1055,16 +1077,23 @@ const JobDetailView = ({ job, onBack, onResponse, onAnalyzeMetadata }) => (
             <span className="text-slate-900 dark:text-white">{formatTimestamp(job.lastInteractionTime)}</span>
           </div>
         </div>
-        <div className="mt-6 pt-4 border-t border-slate-100 dark:border-slate-800 flex flex-wrap gap-2">
-          {RESPONSE_ACTIONS.map(([type, label]) => (
-            <button key={type} onClick={() => onResponse(job, type)} className="px-3 py-2 rounded-lg bg-slate-100 dark:bg-slate-800 text-xs font-bold text-slate-600 dark:text-slate-300">
-              {label}
-            </button>
-          ))}
-        </div>
+        {!job.isCommunityJob && (
+          <div className="mt-6 pt-4 border-t border-slate-100 dark:border-slate-800 flex flex-wrap gap-2">
+            {RESPONSE_ACTIONS.map(([type, label]) => (
+              <button key={type} onClick={() => onResponse(job, type)} className="px-3 py-2 rounded-lg bg-slate-100 dark:bg-slate-800 text-xs font-bold text-slate-600 dark:text-slate-300">
+                {label}
+              </button>
+            ))}
+          </div>
+        )}
       </div>
     </div>
-    <EmailMetadataCheck job={job} onAnalyze={onAnalyzeMetadata} />
+    {job.isCommunityJob ? (
+      <div className="glass-card dark:bg-slate-900/50 dark:border-slate-800 mt-8">
+        <h3 className="font-bold text-slate-400 dark:text-slate-500 uppercase text-xs tracking-widest mb-4">Community Evidence</h3>
+        <p className="text-sm font-bold text-slate-600 dark:text-slate-300">{job.reportSummary}</p>
+      </div>
+    ) : <EmailMetadataCheck job={job} onAnalyze={onAnalyzeMetadata} />}
   </div>
 )
 
@@ -1352,7 +1381,8 @@ function App() {
       axios.get(`${API_URL}/api/analytics`, { headers }),
     ])
     const dashboardJobs = dashboardRes.data.jobs || []
-    const derivedAnalytics = buildAnalyticsFromJobs(dashboardJobs, dashboardRes.data.signalCount ?? 0, dashboardRes.data.lastUpdated || null)
+    const personalJobs = dashboardRes.data.personalJobs || dashboardJobs.filter(job => !job.isCommunityJob)
+    const derivedAnalytics = buildAnalyticsFromJobs(personalJobs, dashboardRes.data.signalCount ?? 0, dashboardRes.data.lastUpdated || null)
     const backendAnalytics = analyticsRes.data || {}
     setJobs(dashboardJobs)
     setAnalytics((backendAnalytics.totalApplications || 0) > 0 ? backendAnalytics : derivedAnalytics)

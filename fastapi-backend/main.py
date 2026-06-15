@@ -44,6 +44,50 @@ print(f"Active AESD DB path: {DB_PATH}")
 jobs_db = []
 signals_db = []
 tracked_jobs_db = {}
+COMMUNITY_SEED_JOBS = [
+    {
+        "jobId": "seed:linkedin:frontend-react-associate",
+        "jobTitle": "Frontend React Developer",
+        "companyName": "Northstar Talent Systems",
+        "jobUrl": "https://www.linkedin.com/jobs/view/frontend-react-developer-northstar-talent-systems",
+        "platform": "linkedin.com",
+        "energySinkScore": 82,
+        "effortScore": 78,
+        "responseScore": 0,
+        "responseStatus": "no_response",
+        "recommendation": "Avoid",
+        "communityReports": 14,
+        "reportSummary": "Repeated applications with long forms and no reported employer response.",
+    },
+    {
+        "jobId": "seed:indeed:data-entry-remote",
+        "jobTitle": "Remote Data Entry Specialist",
+        "companyName": "BrightPath Hiring Group",
+        "jobUrl": "https://www.indeed.com/viewjob?jk=brightpath-remote-data-entry",
+        "platform": "indeed.com",
+        "energySinkScore": 74,
+        "effortScore": 64,
+        "responseScore": 0,
+        "responseStatus": "no_response",
+        "recommendation": "Avoid",
+        "communityReports": 9,
+        "reportSummary": "High applicant effort and repeated no-response feedback from users.",
+    },
+    {
+        "jobId": "seed:linkedin:junior-ml-analyst",
+        "jobTitle": "Junior Machine Learning Analyst",
+        "companyName": "Atlas Recruiting Network",
+        "jobUrl": "https://www.linkedin.com/jobs/view/junior-machine-learning-analyst-atlas-recruiting-network",
+        "platform": "linkedin.com",
+        "energySinkScore": 58,
+        "effortScore": 69,
+        "responseScore": 20,
+        "responseStatus": "acknowledged",
+        "recommendation": "Apply cautiously",
+        "communityReports": 7,
+        "reportSummary": "Some acknowledgments, but users reported low follow-up after assessment steps.",
+    },
+]
 SUPPORTED_SIGNAL_TYPES = {
     "page_visit",
     "time_spent",
@@ -564,14 +608,23 @@ async def analyze_job(job: JobAnalysisRequest):
 async def get_dashboard(request: Request):
   user_email = get_current_user_email(request)
   user_id = get_user_id(user_email)
-  print("AESD dashboard requested:", {"user_id": user_id, "email": user_email})
   with get_db() as conn:
     signal_count = conn.execute("SELECT COUNT(*) AS count FROM signals WHERE user_email = ?", (user_email,)).fetchone()["count"]
-  enhanced_jobs = build_dashboard_jobs(user_email)
+  personal_jobs, community_jobs = build_dashboard_payload(user_email)
+  enhanced_jobs = personal_jobs + community_jobs
+  print("AESD dashboard requested:", {
+    "user_id": user_id,
+    "email": user_email,
+    "personalJobs": len(personal_jobs),
+    "communityJobs": len(community_jobs),
+  })
   return {
     "jobs": enhanced_jobs,
+    "personalJobs": personal_jobs,
+    "communityJobs": community_jobs,
+    "hasPersonalJobs": bool(personal_jobs),
     "signalCount": signal_count,
-    "latestScore": max([(job.get("energySinkScore") or 0) for job in enhanced_jobs], default=0),
+    "latestScore": max([(job.get("energySinkScore") or 0) for job in personal_jobs], default=0),
     "lastUpdated": int(time.time())
   }
 
@@ -727,6 +780,121 @@ def build_dashboard_jobs(user_email):
           "lastInteractionTime": tracked["last_interaction_time"],
         })
     return enhanced_jobs
+
+def build_seed_community_jobs():
+    now = int(time.time())
+    return [
+        {
+            "id": item["jobId"],
+            "jobId": item["jobId"],
+            "title": item["jobTitle"],
+            "company_name": item["companyName"],
+            "jobTitle": item["jobTitle"],
+            "companyName": item["companyName"],
+            "jobUrl": item["jobUrl"],
+            "platform": item["platform"],
+            "ai_score": 0,
+            "energySinkScore": item["energySinkScore"],
+            "scoreStatus": "community_seed",
+            "effortScore": item["effortScore"],
+            "responseScore": item["responseScore"],
+            "recommendation": item["recommendation"],
+            "responseStatus": item["responseStatus"],
+            "responseSource": "community_seed",
+            "lastResponseAt": None,
+            "timeToResponseHours": None,
+            "totalTimeSpent": 0,
+            "maxScrollDepth": 0,
+            "applyClicks": 0,
+            "delayPenalty": 0,
+            "lastInteractionTime": now,
+            "source": "community_seed",
+            "isCommunityJob": True,
+            "communityReports": item["communityReports"],
+            "reportSummary": item["reportSummary"],
+        }
+        for item in COMMUNITY_SEED_JOBS
+    ]
+
+def build_community_jobs(current_user_email, limit=8):
+    community_jobs = []
+    with get_db() as conn:
+        rows = conn.execute("""
+          SELECT
+            job_id,
+            job_title,
+            company_name,
+            job_url,
+            platform,
+            page_type,
+            COUNT(DISTINCT user_email) AS reporter_count,
+            AVG(COALESCE(energy_sink_score, 0)) AS average_energy_score,
+            AVG(COALESCE(effort_score, 0)) AS average_effort_score,
+            AVG(COALESCE(response_score, 0)) AS average_response_score,
+            MAX(COALESCE(last_interaction_time, 0)) AS last_interaction_time
+          FROM tracked_jobs
+          WHERE user_email != ?
+            AND job_title != ''
+            AND company_name != ''
+          GROUP BY job_id, job_title, company_name, job_url, platform, page_type
+          HAVING reporter_count >= 1
+          ORDER BY average_energy_score DESC, last_interaction_time DESC
+          LIMIT ?
+        """, (current_user_email, limit)).fetchall()
+
+    for row in rows:
+        average_energy_score = round(float(row["average_energy_score"] or 0), 1)
+        average_effort_score = round(float(row["average_effort_score"] or 0), 1)
+        average_response_score = round(float(row["average_response_score"] or 0), 1)
+        if average_energy_score >= 70:
+            recommendation = "Avoid"
+        elif average_energy_score >= 40:
+            recommendation = "Apply cautiously"
+        else:
+            recommendation = "Apply confidently"
+        community_jobs.append({
+            "id": row["job_id"],
+            "jobId": row["job_id"],
+            "title": row["job_title"],
+            "company_name": row["company_name"],
+            "jobTitle": row["job_title"],
+            "companyName": row["company_name"],
+            "jobUrl": row["job_url"],
+            "platform": row["platform"],
+            "ai_score": 0,
+            "energySinkScore": average_energy_score,
+            "scoreStatus": "community",
+            "effortScore": average_effort_score,
+            "responseScore": average_response_score,
+            "recommendation": recommendation,
+            "responseStatus": "community_reported",
+            "responseSource": "community",
+            "lastResponseAt": None,
+            "timeToResponseHours": None,
+            "totalTimeSpent": 0,
+            "maxScrollDepth": 0,
+            "applyClicks": 0,
+            "delayPenalty": 0,
+            "lastInteractionTime": row["last_interaction_time"],
+            "source": "community",
+            "isCommunityJob": True,
+            "communityReports": row["reporter_count"],
+            "reportSummary": f"{row['reporter_count']} user(s) contributed signals for this listing.",
+        })
+    return community_jobs
+
+def build_dashboard_payload(user_email):
+    personal_jobs = build_dashboard_jobs(user_email)
+    community_jobs = build_community_jobs(user_email)
+    seen = {job["jobId"] for job in personal_jobs}
+    visible_community_jobs = [job for job in community_jobs if job["jobId"] not in seen]
+    if len(personal_jobs) + len(visible_community_jobs) < 3:
+        for job in build_seed_community_jobs():
+            if job["jobId"] not in seen and all(existing["jobId"] != job["jobId"] for existing in visible_community_jobs):
+                visible_community_jobs.append(job)
+            if len(personal_jobs) + len(visible_community_jobs) >= 6:
+                break
+    return personal_jobs, visible_community_jobs
 
 def calculate_analytics_from_jobs(jobs, signal_count=0):
     valid_jobs = [job for job in jobs if str(job.get("jobId", "")).startswith("linkedin:") or job.get("effortScore", 0) > 0]
@@ -1042,6 +1210,44 @@ async def get_score(job_id: int):
         "scoreStatus": result.get("scoreStatus", "scored"),
         "recommendation": result["recommendation"],
         "alert": result["alert"]
+    }
+
+@app.get("/api/community/leaderboard")
+async def get_community_leaderboard(request: Request):
+    user_email = get_current_user_email(request)
+    community_jobs = build_community_jobs(user_email, limit=25) + build_seed_community_jobs()
+    by_company = {}
+    for job in community_jobs:
+        company = job.get("companyName") or "Unknown"
+        bucket = by_company.setdefault(company, {
+            "companyName": company,
+            "applications": 0,
+            "scoreTotal": 0,
+            "responseTotal": 0,
+            "jobTitle": job.get("jobTitle"),
+        })
+        reports = int(job.get("communityReports") or 1)
+        bucket["applications"] += reports
+        bucket["scoreTotal"] += float(job.get("energySinkScore") or 0) * reports
+        bucket["responseTotal"] += float(job.get("responseScore") or 0) * reports
+
+    ranked = []
+    for company in by_company.values():
+        applications = max(company["applications"], 1)
+        average_energy_score = round(company["scoreTotal"] / applications, 1)
+        response_rate = round((company["responseTotal"] / applications))
+        ranked.append({
+            "companyName": company["companyName"],
+            "jobTitle": company["jobTitle"],
+            "applications": company["applications"],
+            "averageEnergyScore": average_energy_score,
+            "responseRate": response_rate,
+            "status": "Community reported",
+        })
+    ranked.sort(key=lambda item: item["averageEnergyScore"], reverse=True)
+    return {
+        "topEnergySinks": ranked[:5],
+        "mostResponsive": sorted(ranked, key=lambda item: item["responseRate"], reverse=True)[:5],
     }
 
 @app.get("/api/analytics")
